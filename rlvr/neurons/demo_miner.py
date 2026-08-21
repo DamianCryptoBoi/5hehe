@@ -488,6 +488,37 @@ def build_demo_miner_app(miner: DemoMiner):
             )
         return response
 
+    @app.get("/solve")
+    async def solve_endpoint(request: Request) -> Response:
+        await maybe_sync_metagraph()
+        body = await read_bounded(request)
+        if body is None:
+            return Response(
+                content=b'{"error":"request body too large"}',
+                status_code=413,
+                media_type="application/json",
+            )
+
+        status, payload = await miner.handle_request(request.headers, body)
+        if isinstance(payload, SolutionPayload):
+            response_body = payload.model_dump_json().encode("utf-8")
+        else:
+            response_body = json.dumps(payload, separators=(",", ":")).encode("utf-8")
+        response = Response(
+            content=response_body,
+            status_code=status,
+            media_type="application/json",
+        )
+        if status == 200 and miner.wallet is not None:
+            response.headers.update(
+                sign_message(
+                    miner.wallet,
+                    response_body,
+                    signed_for=request.headers.get("Epistula-Signed-By", ""),
+                )
+            )
+        return response
+    
     @app.get("/health")
     async def health() -> dict[str, str]:
         return {"status": "ok", "model": miner.model_name}
