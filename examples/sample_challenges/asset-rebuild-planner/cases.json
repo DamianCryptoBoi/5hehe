@@ -1,0 +1,29 @@
+{
+  "language": "python",
+  "entrypoint": "plan_rebuild",
+  "cases": [
+    {
+      "name": "build two independent assets",
+      "args": [{"a": "A", "b": "B"}, {"a": [], "b": []}, {}, []],
+      "kwargs": {},
+      "expected": {"status": "ok", "recovery": "valid", "discard": [], "rebuild": ["a", "b"], "full_hashes": [["a", "4de3b79316e3d6ad6c07f563ab9342b279fd4c8d4e5d66e0112be6de20a182ec"], ["b", "1ee101a2c52ebd6f7742da0a9af16764dd55d7069c655703a8811289f1e15265"]]}
+    },
+    {
+      "name": "build one asset",
+      "args": [{"a": "local-a"}, {"a": []}, {}, []],
+      "kwargs": {},
+      "expected": {"status": "ok", "recovery": "valid", "discard": [], "rebuild": ["a"], "full_hashes": [["a", "8483bab8aa056a24ed8e0525d4203e0a91214e33e6a5d600dd994bde330bbd22"]]}
+    },
+    {
+      "name": "reuse one valid cache card",
+      "args": [
+        {"a": "local-a"},
+        {"a": []},
+        {"a": {"local": "local-a", "dependencies": [], "full": "8483bab8aa056a24ed8e0525d4203e0a91214e33e6a5d600dd994bde330bbd22"}},
+        []
+      ],
+      "kwargs": {},
+      "expected": {"status": "ok", "recovery": "valid", "discard": [], "rebuild": [], "full_hashes": [["a", "8483bab8aa056a24ed8e0525d4203e0a91214e33e6a5d600dd994bde330bbd22"]]}
+    }
+  ]
+}

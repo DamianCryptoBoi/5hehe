@@ -1,0 +1,24 @@
+{
+  "language": "python",
+  "entrypoint": "extent_journal",
+  "cases": [
+    {
+      "name": "claim lookup and release",
+      "args": [4, 20, 1, [["claim", 1, 7, 0, 5], ["lookup", 6], ["release", 1], ["lookup", 0]]],
+      "kwargs": {},
+      "expected": [["claimed", 0, 8], ["extent", 1, 7, 0, 5, 8, 6], ["released", 0, 8], null]
+    },
+    {
+      "name": "adjacent and overlapping claims",
+      "args": [4, 20, 1, [["claim", 1, 1, 0, 4], ["claim", 2, 2, 4, 4], ["claim", 3, 3, 2, 4], ["lookup", 4]]],
+      "kwargs": {},
+      "expected": [["claimed", 0, 4], ["claimed", 4, 8], ["rejected"], ["extent", 2, 2, 4, 4, 8, 0]]
+    },
+    {
+      "name": "resize in place",
+      "args": [4, 24, 1, [["claim", 1, 5, 4, 5], ["resize", 1, 9], ["lookup", 14]]],
+      "kwargs": {},
+      "expected": [["claimed", 4, 12], ["resized", 4, 12, 4, 16], ["extent", 1, 5, 4, 9, 16, 10]]
+    }
+  ]
+}

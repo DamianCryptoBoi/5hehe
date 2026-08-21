@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 
 import httpx
@@ -14,6 +15,7 @@ from rlvr.neurons.demo_miner import (
     GLM52Client,
     build_demo_miner_app,
     build_model_messages,
+    build_verification_messages,
     extract_python,
 )
 from rlvr.neurons.live import LiveSolverClient
@@ -73,6 +75,28 @@ class FailingGLM(FakeGLM):
         )
 
 
+class SequencedGLM(FakeGLM):
+    def __init__(self, *outputs: str | Exception):
+        self.outputs = list(outputs)
+        self.calls: list[tuple[list[dict[str, str]], float]] = []
+
+    async def complete(self, messages, *, timeout_s):
+        self.calls.append((messages, timeout_s))
+        output = self.outputs.pop(0)
+        if isinstance(output, Exception):
+            raise output
+        return output
+
+
+class SlowReviewGLM(SequencedGLM):
+    async def complete(self, messages, *, timeout_s):
+        self.calls.append((messages, timeout_s))
+        if len(self.calls) == 1:
+            return self.outputs.pop(0)
+        await asyncio.sleep(timeout_s * 10.0)
+        return self.outputs.pop(0)
+
+
 def demo_settings(**updates) -> DemoMinerSettings:
     return DemoMinerSettings(
         _env_file=None,
@@ -106,6 +130,124 @@ def test_model_prompt_contains_only_public_task_data():
     assert "request-id" not in rendered
     assert "<problem_statement>" in rendered
     assert "<public_examples_json>" in rendered
+
+
+def test_verification_prompt_reuses_task_and_keeps_candidate_separate():
+    request = TaskRequest(
+        problem_id="request-id",
+        language="python",
+        statement="Add two integers, including negative values.",
+        entrypoint="add",
+        public_examples=[Case(args=[-2, 5], expected=3)],
+    )
+
+    messages = build_verification_messages(
+        request,
+        "def add(a, b):\n    return abs(a) + abs(b)",
+    )
+    rendered = json.dumps(messages)
+
+    assert messages[-2]["role"] == "assistant"
+    assert "return abs(a) + abs(b)" in messages[-2]["content"]
+    assert messages[-1]["role"] == "user"
+    assert "independent verification" in messages[-1]["content"]
+    assert "Add two integers, including negative values." in rendered
+    assert '"expected": 3' in messages[1]["content"]
+    assert "request-id" not in rendered
+
+
+async def test_self_verification_corrects_the_initial_draft():
+    corrected = "```python\ndef add(a, b):\n    return a + b\n```"
+    client = SequencedGLM(
+        "```python\ndef add(a, b):\n    return abs(a) + abs(b)\n```",
+        corrected,
+    )
+    miner = DemoMiner(demo_settings(), client)
+    request = TaskRequest(
+        problem_id="p",
+        language="python",
+        statement="Return the sum of two integers.",
+        entrypoint="add",
+        public_examples=[Case(args=[-2, 5], expected=3)],
+    )
+
+    payload = await miner.solve(request, timeout_s=30.0)
+
+    assert payload.code == "def add(a, b):\n    return a + b"
+    assert payload.raw_response == corrected
+    assert len(client.calls) == 2
+    assert client.calls[0][1] == pytest.approx(15.0)
+    assert "Return the sum of two integers." in client.calls[1][0][1]["content"]
+    assert "return abs(a) + abs(b)" in client.calls[1][0][-2]["content"]
+
+
+@pytest.mark.parametrize(
+    "review",
+    [
+        "The candidate looks correct.",
+        "```python\ndef different_name(a, b):\n    return a + b\n```",
+        TimeoutError("review timed out"),
+    ],
+)
+async def test_failed_or_invalid_review_preserves_the_initial_draft(review):
+    draft = "```python\ndef add(a, b):\n    return a + b\n```"
+    client = SequencedGLM(draft, review)
+    miner = DemoMiner(demo_settings(), client)
+    request = TaskRequest(
+        problem_id="p",
+        language="python",
+        statement="Return the sum.",
+        entrypoint="add",
+    )
+
+    payload = await miner.solve(request, timeout_s=30.0)
+
+    assert payload.code == "def add(a, b):\n    return a + b"
+    assert payload.raw_response == draft
+    assert len(client.calls) == 2
+
+
+async def test_review_timeout_returns_the_unreviewed_draft_before_outer_deadline():
+    draft = "```python\ndef add(a, b):\n    return a + b\n```"
+    client = SlowReviewGLM(draft, "```python\ndef add(a, b):\n    return a - b\n```")
+    miner = DemoMiner(
+        demo_settings(miner_self_verify_reserve_s=0.1),
+        client,
+    )
+    request = TaskRequest(
+        problem_id="p",
+        language="python",
+        statement="Return the sum.",
+        entrypoint="add",
+    )
+
+    started = asyncio.get_running_loop().time()
+    payload = await miner.solve(request, timeout_s=0.2)
+    elapsed = asyncio.get_running_loop().time() - started
+
+    assert payload.code == "def add(a, b):\n    return a + b"
+    assert payload.raw_response == draft
+    assert len(client.calls) == 2
+    assert client.calls[1][1] < 0.2
+    assert elapsed < 0.2
+
+
+async def test_self_verification_can_be_disabled_for_one_pass_operation():
+    draft = "```python\ndef add(a, b):\n    return a + b\n```"
+    client = SequencedGLM(draft)
+    miner = DemoMiner(demo_settings(miner_self_verify=False), client)
+    request = TaskRequest(
+        problem_id="p",
+        language="python",
+        statement="Return the sum.",
+        entrypoint="add",
+    )
+
+    payload = await miner.solve(request, timeout_s=30.0)
+
+    assert payload.code == "def add(a, b):\n    return a + b"
+    assert len(client.calls) == 1
+    assert client.calls[0][1] == pytest.approx(30.0)
 
 
 async def test_glm_client_uses_configured_chat_completion_contract():

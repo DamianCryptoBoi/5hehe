@@ -101,7 +101,17 @@ GLM_THINKING=true
 GLM_REASONING_EFFORT=high
 GLM_REQUEST_TIMEOUT_S=280
 GLM_MAX_RETRIES=2
+MINER_SELF_VERIFY=true
+MINER_SELF_VERIFY_RESERVE_S=90
 ```
 
 Lower output or reasoning budgets reduce cost and latency, but may reduce the
 pass rate on harder tasks.
+
+The self-verification pass reuses the complete public task and first draft,
+checks the examples and prompt-derived boundary cases, and returns corrected
+source. The reserve bounds the first provider call so the review has time inside
+the validator deadline. If review fails or returns malformed source, the miner
+keeps the first draft. Review is stopped slightly early to leave wire time for
+that fallback draft. Disable it only when one-pass latency and provider cost
+matter more than the additional accuracy check.

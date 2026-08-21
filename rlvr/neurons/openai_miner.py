@@ -55,6 +55,8 @@ class OpenAICompatibleSettings(BaseSettings):
     )
     openai_request_timeout_s: float = Field(default=280.0, gt=0.0, le=3600.0)
     openai_max_retries: int = Field(default=2, ge=0, le=10)
+    miner_self_verify: bool = True
+    miner_self_verify_reserve_s: float = Field(default=90.0, ge=0.0, le=1800.0)
     openai_fallback_base_url: str = ""
     openai_fallback_model: str = ""
     openai_fallback_api_key: str = ""

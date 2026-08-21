@@ -1,0 +1,24 @@
+{
+  "language": "rust",
+  "entrypoint": "main",
+  "cases": [
+    {
+      "name": "accept retry and revoke",
+      "args": ["4 5 3 5 3\nR 0 ip a 2 1\nR 1 ip b 2 1\nR 2 other A 1 1\nX 3 1\n"],
+      "kwargs": {},
+      "expected": "ACCEPT\nRETRY 5\nACCEPT\nREVOKED\n"
+    },
+    {
+      "name": "proof and permanent quota rejection",
+      "args": ["3 10 5 10 5\nR 0 ip email 1 0\nR 1 ip email 6 1\nX 2 1\n"],
+      "kwargs": {},
+      "expected": "CAPTCHA\nNEVER\nINVALID\n"
+    },
+    {
+      "name": "normalized email expiry",
+      "args": ["3 2 2 3 2\nR 0 one User@X 2 1\nR 1 two user@x 1 1\nR 3 two user@x 1 1\n"],
+      "kwargs": {},
+      "expected": "ACCEPT\nRETRY 3\nACCEPT\n"
+    }
+  ]
+}

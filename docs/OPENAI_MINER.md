@@ -38,6 +38,8 @@ OPENAI_TEMPERATURE=
 OPENAI_REASONING_EFFORT=
 OPENAI_REQUEST_TIMEOUT_S=280
 OPENAI_MAX_RETRIES=2
+MINER_SELF_VERIFY=true
+MINER_SELF_VERIFY_RESERVE_S=90
 
 # Optional secondary OpenAI-compatible endpoint
 OPENAI_FALLBACK_BASE_URL=https://second-provider.example/v1
@@ -134,6 +136,17 @@ not claim access to hidden cases and no hidden challenge data crosses the miner
 wire contract. Evaluate future prompt revisions on a fixed held-out task set;
 change one instruction group at a time and compare full-suite accuracy,
 latency, output validity, and cost.
+
+By default, the miner reserves up to `MINER_SELF_VERIFY_RESERVE_S` seconds of
+the validator deadline for an independent second pass. That pass receives the
+same public statement and examples plus the first draft, re-derives the
+contract, simulates all examples, searches for boundary-case counterexamples,
+and returns a complete corrected solution. A timeout, provider error, or
+malformed replacement falls back to the first draft instead of turning a usable
+answer into a zero. The reviewer is stopped slightly before the outer deadline
+so the unreviewed draft can still be serialized and sent if review runs out of
+time. Set `MINER_SELF_VERIFY=false` to restore one-pass behavior;
+doing so reduces latency and provider cost at the expense of this accuracy gate.
 
 Reasoning remains available to models through `OPENAI_REASONING_EFFORT`, but
 provider-visible reasoning is suppressed before the miner signs its response.

@@ -5,6 +5,7 @@ verifies and authorizes signed task requests, asks GLM-5.2 for a Python
 solution, and signs the exact response bytes with the miner hotkey.
 """
 
+import ast
 import asyncio
 import json
 import re
@@ -70,11 +71,27 @@ RUST_SYSTEM_PROMPT = (
     "Output exactly one complete fenced `rust` code block and no other text."
 )
 
+SELF_VERIFICATION_PROMPT = (
+    "Perform an independent verification of the candidate solution immediately "
+    "above against the original problem statement and public examples. Re-derive "
+    "the required behavior from the statement instead of trusting the candidate's "
+    "approach. Reason privately and:\n"
+    "- simulate the candidate on every public example;\n"
+    "- construct likely boundary and adversarial cases from the stated contract;\n"
+    "- check return/output shape, ordering and tie rules, numeric bounds, and "
+    "complexity; and\n"
+    "- repair every defect you find without weakening or inventing requirements.\n\n"
+    "Return the complete replacement solution even when no change is needed. Do "
+    "not describe the review or output tests. Follow the original system contract "
+    "and output exactly one fenced source block."
+)
+
 _PYTHON_FENCE_RE = re.compile(
     r"```(?:python|py)\s*\n(.*?)```", re.IGNORECASE | re.DOTALL
 )
 _RUST_FENCE_RE = re.compile(r"```rust\s*\n(.*?)```", re.IGNORECASE | re.DOTALL)
 _ANY_FENCE_RE = re.compile(r"```[^\n`]*\n(.*?)```", re.DOTALL)
+_REVIEW_RESPONSE_MARGIN_S = 0.5
 
 
 class DemoMinerSettings(BaseSettings):
@@ -96,6 +113,11 @@ class DemoMinerSettings(BaseSettings):
     )
     glm_request_timeout_s: float = Field(default=280.0, gt=0.0, le=3600.0)
     glm_max_retries: int = Field(default=2, ge=0, le=10)
+
+    # Reserve part of the signed request deadline for a second, independent
+    # prompt-aware review. A failed review never discards the first draft.
+    miner_self_verify: bool = True
+    miner_self_verify_reserve_s: float = Field(default=90.0, ge=0.0, le=1800.0)
 
     netuid: int = Field(default=0, ge=0)
     subtensor_network: str = "test"
@@ -161,6 +183,62 @@ def build_model_messages(request: TaskRequest) -> list[dict[str, str]]:
         },
         {"role": "user", "content": prompt},
     ]
+
+
+def build_verification_messages(
+    request: TaskRequest, candidate_code: str
+) -> list[dict[str, str]]:
+    """Ask for a fresh audit while retaining the exact public task context."""
+
+    language = "rust" if request.language == "rust" else "python"
+    return [
+        *build_model_messages(request),
+        {
+            "role": "assistant",
+            "content": f"```{language}\n{candidate_code.strip()}\n```",
+        },
+        {"role": "user", "content": SELF_VERIFICATION_PROMPT},
+    ]
+
+
+def _extract_code(request: TaskRequest, raw: str) -> str:
+    return extract_rust(raw) if request.language == "rust" else extract_python(raw)
+
+
+def _is_well_formed_replacement(request: TaskRequest, code: str) -> bool:
+    """Cheap, non-executing guard against accepting review prose as source."""
+
+    if not code.strip():
+        return False
+    if request.language == "rust":
+        return re.search(r"\bfn\s+main\s*\(", code) is not None
+    try:
+        tree = ast.parse(code)
+    except (SyntaxError, ValueError, MemoryError, RecursionError):
+        return False
+    for statement in tree.body:
+        if (
+            isinstance(statement, ast.FunctionDef)
+            and statement.name == request.entrypoint
+        ):
+            return True
+        if (
+            isinstance(statement, ast.ClassDef)
+            and statement.name == request.entrypoint
+        ):
+            return True
+        if isinstance(statement, (ast.Assign, ast.AnnAssign)):
+            targets = (
+                statement.targets
+                if isinstance(statement, ast.Assign)
+                else [statement.target]
+            )
+            if any(
+                isinstance(target, ast.Name) and target.id == request.entrypoint
+                for target in targets
+            ):
+                return True
+    return False
 
 
 class GLM52Client:
@@ -325,12 +403,19 @@ class DemoMiner:
         return True
 
     async def solve(self, request: TaskRequest, timeout_s: float) -> SolutionPayload:
-        """Call the model and return an empty, valid payload on provider failure."""
+        """Generate, independently review, and return the strongest valid draft."""
 
+        deadline = time.monotonic() + timeout_s
+        self_verify = bool(getattr(self.settings, "miner_self_verify", True))
+        reserve_s = min(
+            float(getattr(self.settings, "miner_self_verify_reserve_s", 90.0)),
+            timeout_s / 2.0,
+        )
+        draft_timeout_s = timeout_s - reserve_s if self_verify else timeout_s
         try:
             raw = await self.client.complete(
                 build_model_messages(request),
-                timeout_s=timeout_s,
+                timeout_s=draft_timeout_s,
             )
         except httpx.HTTPStatusError as exc:
             print(
@@ -349,13 +434,47 @@ class DemoMiner:
                 code="",
                 raw_response="<model request failed>",
             )
+        draft_code = _extract_code(request, raw)
+        if not self_verify or not draft_code:
+            return SolutionPayload(
+                problem_id=request.problem_id,
+                code=draft_code,
+                raw_response=raw,
+            )
+
+        remaining_s = deadline - time.monotonic()
+        review_timeout_s = remaining_s - min(
+            _REVIEW_RESPONSE_MARGIN_S,
+            max(0.0, remaining_s / 4.0),
+        )
+        if review_timeout_s > 0.0:
+            try:
+                reviewed_raw = await asyncio.wait_for(
+                    self.client.complete(
+                        build_verification_messages(request, draft_code),
+                        timeout_s=review_timeout_s,
+                    ),
+                    timeout=review_timeout_s,
+                )
+                reviewed_code = _extract_code(request, reviewed_raw)
+                if _is_well_formed_replacement(request, reviewed_code):
+                    return SolutionPayload(
+                        problem_id=request.problem_id,
+                        code=reviewed_code,
+                        raw_response=reviewed_raw,
+                    )
+                print(
+                    f"[{self.log_prefix}] self-verification returned invalid "
+                    "source; using initial draft"
+                )
+            except Exception as exc:  # noqa: BLE001 - retain the usable draft
+                print(
+                    f"[{self.log_prefix}] self-verification failed; using "
+                    f"initial draft ({type(exc).__name__})"
+                )
         return SolutionPayload(
             problem_id=request.problem_id,
-            code=(
-                extract_rust(raw)
-                if request.language == "rust"
-                else extract_python(raw)
-            ),
+            code=draft_code,
             raw_response=raw,
         )
 
