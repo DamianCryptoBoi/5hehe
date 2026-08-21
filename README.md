@@ -103,7 +103,8 @@ dropped before reveal.
 An OpenAI-compatible miner is included for operators. It preserves the signed
 Hone wire protocol while sending public coding tasks to a configurable
 `POST /chat/completions` endpoint. It requires `OPENAI_MODEL` and normally an
-`OPENAI_API_KEY`; validators do not need a model-provider key. See
+`OPENAI_API_KEY`; an optional second URL/model can take over after primary
+retries are exhausted. Validators do not need a model-provider key. See
 [`docs/OPENAI_MINER.md`](docs/OPENAI_MINER.md).
 
 The original GLM-5.2 demo miner remains available as a minimal protocol

@@ -39,6 +39,12 @@ OPENAI_REASONING_EFFORT=
 OPENAI_REQUEST_TIMEOUT_S=280
 OPENAI_MAX_RETRIES=2
 
+# Optional secondary OpenAI-compatible endpoint
+OPENAI_FALLBACK_BASE_URL=https://second-provider.example/v1
+OPENAI_FALLBACK_MODEL=<fallback-chat-completions-model-id>
+OPENAI_FALLBACK_API_KEY=<fallback-provider-key>
+OPENAI_FALLBACK_RESERVE_S=60
+
 NETUID=5
 SUBTENSOR_NETWORK=finney
 WALLET_NAME=<wallet-name>
@@ -53,6 +59,20 @@ AXON_EXTERNAL_IP=<public-ip-if-auto-detection-is-unsuitable>
 `https://provider.example/v1`, or the complete
 `https://provider.example/v1/chat/completions` URL. The miner appends
 `/chat/completions` only when it is absent.
+
+Fallback is disabled when `OPENAI_FALLBACK_BASE_URL` and
+`OPENAI_FALLBACK_MODEL` are both empty. Set both to enable it. The fallback key
+is optional: an empty `OPENAI_FALLBACK_API_KEY` reuses `OPENAI_API_KEY`, which
+is convenient when both models are served by the same provider. Use a separate
+key when the URLs belong to different providers.
+
+The primary endpoint receives the first attempt and all retries. Only after it
+has exhausted that policy does the client call the fallback endpoint. The
+fallback uses the same `OPENAI_MAX_RETRIES` policy. A fast primary failure
+leaves almost the entire request budget for fallback; a slow primary cannot
+consume the last `OPENAI_FALLBACK_RESERVE_S` seconds. The reserve is capped at
+half of the actual validator/provider budget, and setting it to `0` disables
+the reservation without disabling fallback.
 
 The default omits `temperature` and `reasoning_effort` because those optional
 fields are not uniformly supported by compatible servers. Configure them only
@@ -115,6 +135,15 @@ wire contract. Evaluate future prompt revisions on a fixed held-out task set;
 change one instruction group at a time and compare full-suite accuracy,
 latency, output validity, and cost.
 
+Reasoning remains available to models through `OPENAI_REASONING_EFFORT`, but
+provider-visible reasoning is suppressed before the miner signs its response.
+When a Python or Rust fenced block is present, only the first matching solution
+block is retained; prose and other fenced planning artifacts are discarded.
+For unfenced responses, common `<think>`, `<thinking>`, `<thought>`,
+`<reasoning>`, and `<analysis>` blocks are removed. Provider-specific reasoning
+fields outside `message.content` are never forwarded. A response containing
+only reasoning is treated as a provider failure so configured fallback can run.
+
 ## Request safety and capacity
 
 The default authorization policy accepts only registered hotkeys that
@@ -130,7 +159,8 @@ MINER_METAGRAPH_SYNC_S=300
 ```
 
 Provider calls use one absolute budget bounded by both the validator's task
-deadline and `OPENAI_REQUEST_TIMEOUT_S`. HTTP 429 and 5xx responses and network
-transport failures are retried within that same budget. A provider failure
-returns a valid signed empty solution, which safely scores zero without
-breaking the validator round.
+deadline and `OPENAI_REQUEST_TIMEOUT_S`. HTTP 408, 409, 429, and 5xx responses,
+timeouts, and network transport failures are retried with short exponential
+backoff within that same budget. Other terminal primary errors also trigger
+fallback immediately. If fallback also fails, the miner returns a valid signed
+empty solution, which safely scores zero without breaking the validator round.

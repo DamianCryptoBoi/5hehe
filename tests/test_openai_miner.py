@@ -96,6 +96,78 @@ async def test_chat_completion_contract_and_auth_header():
     }
 
 
+@pytest.mark.parametrize(
+    "provider_content, expected",
+    [
+        (
+            "<think>private chain of thought</think>\n"
+            "```python\ndef f():\n    return '<think>code data</think>'\n```\n"
+            "The implementation is above.",
+            "```python\ndef f():\n    return '<think>code data</think>'\n```",
+        ),
+        (
+            "<analysis>private analysis</analysis>\ndef f():\n    return 1",
+            "def f():\n    return 1",
+        ),
+        (
+            "Planning artifact:\n```json\n{\"approach\": \"discard\"}\n```\n"
+            "```rust\nfn main() {}\n```\n<reasoning>also private</reasoning>",
+            "```rust\nfn main() {}\n```",
+        ),
+    ],
+)
+async def test_reasoning_text_is_suppressed_from_completion(
+    provider_content,
+    expected,
+):
+    async def handler(_request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            json={
+                "choices": [
+                    {
+                        "message": {
+                            "content": provider_content,
+                            "reasoning_content": "separate private reasoning",
+                        }
+                    }
+                ]
+            },
+        )
+
+    settings = miner_settings()
+    http = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    client = OpenAICompatibleClient(settings, http=http)
+    try:
+        content = await client.complete([], timeout_s=30.0)
+    finally:
+        await http.aclose()
+
+    assert content == expected
+    assert "private" not in content
+
+
+async def test_reasoning_without_a_solution_is_a_provider_failure():
+    async def handler(_request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            json={
+                "choices": [
+                    {"message": {"content": "<think>reasoning only</think>"}}
+                ]
+            },
+        )
+
+    settings = miner_settings()
+    http = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    client = OpenAICompatibleClient(settings, http=http)
+    try:
+        with pytest.raises(RuntimeError, match="invalid response"):
+            await client.complete([], timeout_s=30.0)
+    finally:
+        await http.aclose()
+
+
 async def test_optional_compatible_fields_and_provider_extensions():
     captured = {}
 
@@ -173,6 +245,132 @@ async def test_explicit_local_server_can_run_without_authentication():
 
     assert content == "def f(): return 1"
     assert captured["authorization"] is None
+
+
+async def test_fallback_runs_only_after_primary_retries_are_exhausted(monkeypatch):
+    calls = []
+
+    async def no_retry_delay(_seconds: float) -> None:
+        return None
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        body = json.loads(request.content)
+        calls.append(
+            (
+                request.url.host,
+                body["model"],
+                request.headers.get("authorization"),
+            )
+        )
+        if request.url.host == "primary.example":
+            return httpx.Response(503, json={"error": "primary unavailable"})
+        return httpx.Response(
+            200,
+            json={"choices": [{"message": {"content": "fallback code"}}]},
+        )
+
+    monkeypatch.setattr(
+        "rlvr.neurons.openai_miner.asyncio.sleep",
+        no_retry_delay,
+    )
+    settings = miner_settings(
+        openai_base_url="https://primary.example/v1",
+        openai_model="primary/model",
+        openai_max_retries=2,
+        openai_fallback_base_url="https://fallback.example/v1",
+        openai_fallback_model="fallback/model",
+        openai_fallback_api_key="fallback-key",
+    )
+    http = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    client = OpenAICompatibleClient(settings, http=http)
+    try:
+        content = await client.complete([], timeout_s=30.0)
+    finally:
+        await http.aclose()
+
+    assert content == "fallback code"
+    assert calls == [
+        ("primary.example", "primary/model", "Bearer test-key"),
+        ("primary.example", "primary/model", "Bearer test-key"),
+        ("primary.example", "primary/model", "Bearer test-key"),
+        ("fallback.example", "fallback/model", "Bearer fallback-key"),
+    ]
+
+
+async def test_successful_primary_never_calls_configured_fallback():
+    hosts = []
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        hosts.append(request.url.host)
+        return httpx.Response(
+            200,
+            json={"choices": [{"message": {"content": "primary code"}}]},
+        )
+
+    settings = miner_settings(
+        openai_base_url="https://primary.example/v1",
+        openai_fallback_base_url="https://fallback.example/v1",
+        openai_fallback_model="fallback/model",
+    )
+    http = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    client = OpenAICompatibleClient(settings, http=http)
+    try:
+        content = await client.complete([], timeout_s=30.0)
+    finally:
+        await http.aclose()
+
+    assert content == "primary code"
+    assert hosts == ["primary.example"]
+
+
+async def test_failure_is_terminal_after_fallback_retries_are_exhausted(
+    monkeypatch,
+):
+    hosts = []
+
+    async def no_retry_delay(_seconds: float) -> None:
+        return None
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        hosts.append(request.url.host)
+        return httpx.Response(503, json={"error": "unavailable"})
+
+    monkeypatch.setattr(
+        "rlvr.neurons.openai_miner.asyncio.sleep",
+        no_retry_delay,
+    )
+    settings = miner_settings(
+        openai_base_url="https://primary.example/v1",
+        openai_max_retries=1,
+        openai_fallback_base_url="https://fallback.example/v1",
+        openai_fallback_model="fallback/model",
+    )
+    http = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    client = OpenAICompatibleClient(settings, http=http)
+    try:
+        with pytest.raises(RuntimeError, match="primary and fallback"):
+            await client.complete([], timeout_s=30.0)
+    finally:
+        await http.aclose()
+
+    assert hosts == [
+        "primary.example",
+        "primary.example",
+        "fallback.example",
+        "fallback.example",
+    ]
+
+
+@pytest.mark.parametrize(
+    "updates",
+    [
+        {"openai_fallback_base_url": "https://fallback.example/v1"},
+        {"openai_fallback_model": "fallback/model"},
+    ],
+)
+def test_fallback_url_and_model_must_be_configured_together(updates):
+    with pytest.raises(ValueError, match="must be configured together"):
+        miner_settings(**updates)
 
 
 @pytest.mark.parametrize(
