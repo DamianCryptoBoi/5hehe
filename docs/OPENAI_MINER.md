@@ -40,6 +40,7 @@ OPENAI_REQUEST_TIMEOUT_S=280
 OPENAI_MAX_RETRIES=2
 MINER_SELF_VERIFY=true
 MINER_SELF_VERIFY_RESERVE_S=90
+MINER_SELF_VERIFY_MAX_ATTEMPTS=3
 
 # Optional secondary OpenAI-compatible endpoint
 OPENAI_FALLBACK_BASE_URL=https://second-provider.example/v1
@@ -128,11 +129,13 @@ inference. Records are JSONL and include a semantic task fingerprint plus
 non-secret receipt metadata. Hidden tests are not sent to miners, so this archive
 contains only the public task and cannot recover the private evaluation suite.
 
-Set `MINER_SELF_TEST=true` to run public examples and operator-owned tests from
-`MINER_SELF_TEST_FILE` before returning a solution. Tests are selected by the
-semantic task fingerprint written by the task archive and run in the configured
-Docker sandbox. This is local validation only; it does not provide validator
-hidden tests or their results to the miner.
+With `MINER_SELF_TEST=true`, the initial response contains source and a fixed
+model-generated test suite. The miner executes it with public examples and
+operator-owned tests from `MINER_SELF_TEST_FILE`. A pass is returned immediately;
+a failure enters a repair/retest loop bounded by
+`MINER_SELF_VERIFY_MAX_ATTEMPTS` and the signed request deadline. Tests remain
+fixed across repairs. This is local validation only and does not expose
+validator hidden tests or results.
 
 To exercise the real OpenAI-compatible provider with all five samples, including
 the signed miner endpoint, self-review, and Docker self-tests, run from the
@@ -150,12 +153,24 @@ fails any case. Structured results are appended to
 `data/miner_sample_smoke.jsonl`; generated draft, review, and submitted source
 files are retained under `data/miner_sample_smoke_artifacts/<run-id>/`.
 
+To expose only the statement and let the miner generate every solve-time case:
+
+```bash
+PYTHONPATH=. .venv/bin/python scripts/smoke_miner_samples.py \
+  --provider openai --example extent-journal --problem-only
+```
+
+The sample's authored cases are withheld until post-response reporting. Inspect
+`request.json`, `generated_tests.json`, the draft/review source, and submitted
+source under the printed artifact directory. In this mode, `request.json` has an
+empty `public_examples` list; repeated repairs are retained as `repair_N.*`.
+
 ## Solver prompt
 
 Python and Rust use separate, compact system prompts that mirror their actual
-validator sandboxes. The model is asked to reason privately about the full
-specification, algorithm, complexity, public examples, and applicable boundary
-cases before returning exactly one fenced source block. The public statement,
+validator sandboxes. The initial call asks for a fenced `self-tests` JSON block
+and a fenced source block; repair calls return one complete source block. The
+public statement,
 entrypoint metadata, and examples are placed in separate tagged sections so
 their roles remain clear on long challenges.
 
@@ -166,20 +181,17 @@ change one instruction group at a time and compare full-suite accuracy,
 latency, output validity, and cost.
 
 By default, the miner reserves up to `MINER_SELF_VERIFY_RESERVE_S` seconds of
-the validator deadline for an independent second pass. That pass receives the
-same public statement and examples plus the first draft, re-derives the
-contract, simulates all examples, searches for boundary-case counterexamples,
-and returns a complete corrected solution. A timeout, provider error, or
-malformed replacement falls back to the first draft instead of turning a usable
-answer into a zero. The reviewer is stopped slightly before the outer deadline
-so the unreviewed draft can still be serialized and sent if review runs out of
-time. Set `MINER_SELF_VERIFY=false` to restore one-pass behavior;
-doing so reduces latency and provider cost at the expense of this accuracy gate.
+the validator deadline for repair. Each failed candidate and its test evidence
+are reviewed and retested until it passes, the attempt cap is reached, or the
+deadline margin is exhausted. A candidate that already passed skips review.
+When no tests execute, the existing single independent review remains as a
+fail-open fallback. Set `MINER_SELF_VERIFY=false` for one-pass operation.
 
 Reasoning remains available to models through `OPENAI_REASONING_EFFORT`, but
 provider-visible reasoning is suppressed before the miner signs its response.
-When a Python or Rust fenced block is present, only the first matching solution
-block is retained; prose and other fenced planning artifacts are discarded.
+When a Python or Rust fenced block is present, the first matching solution and
+optional `self-tests` block are retained; prose and other fenced planning
+artifacts are discarded.
 For unfenced responses, common `<think>`, `<thinking>`, `<thought>`,
 `<reasoning>`, and `<analysis>` blocks are removed. Provider-specific reasoning
 fields outside `message.content` are never forwarded. A response containing
@@ -197,8 +209,9 @@ MINER_MIN_STAKE=0
 MINER_MAX_CONCURRENT_REQUESTS=4
 MINER_MAX_REQUEST_BYTES=1000000
 MINER_TASK_ARCHIVE_FILE=data/miner_tasks.jsonl
-MINER_SELF_TEST=false
+MINER_SELF_TEST=true
 MINER_SELF_TEST_FILE=data/miner_tests.jsonl
+MINER_SELF_TEST_MAX_GENERATED_CASES=8
 MINER_SELF_TEST_EXECUTOR=docker
 MINER_SELF_TEST_TIMEOUT_S=5
 MINER_METAGRAPH_SYNC_S=300

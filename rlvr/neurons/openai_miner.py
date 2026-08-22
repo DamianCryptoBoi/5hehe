@@ -27,6 +27,7 @@ _FENCED_CODE_RE = re.compile(
     r"```(?P<label>[^\n`]*)\n.*?```",
     re.DOTALL,
 )
+_SELF_TEST_LABELS = {"self-tests", "self_tests"}
 _REASONING_BLOCK_RE = re.compile(
     r"<(think|thinking|thought|reasoning|analysis)\b[^>]*>.*?</\1\s*>",
     re.IGNORECASE | re.DOTALL,
@@ -57,6 +58,7 @@ class OpenAICompatibleSettings(BaseSettings):
     openai_max_retries: int = Field(default=2, ge=0, le=10)
     miner_self_verify: bool = True
     miner_self_verify_reserve_s: float = Field(default=90.0, ge=0.0, le=1800.0)
+    miner_self_verify_max_attempts: int = Field(default=3, ge=1, le=16)
     openai_fallback_base_url: str = ""
     openai_fallback_model: str = ""
     openai_fallback_api_key: str = ""
@@ -77,8 +79,9 @@ class OpenAICompatibleSettings(BaseSettings):
     miner_max_concurrent_requests: int = Field(default=4, ge=1, le=256)
     miner_max_request_bytes: int = Field(default=1_000_000, ge=1, le=10_000_000)
     miner_task_archive_file: str = "data/miner_tasks.jsonl"
-    miner_self_test: bool = False
+    miner_self_test: bool = True
     miner_self_test_file: str = "data/miner_tests.jsonl"
+    miner_self_test_max_generated_cases: int = Field(default=8, ge=1, le=64)
     miner_self_test_executor: Literal["docker", "subprocess"] = "docker"
     miner_self_test_timeout_s: float = Field(default=5.0, gt=0.0, le=300.0)
     miner_self_test_docker_image: str = "python:3.12-slim"
@@ -117,7 +120,7 @@ def _json_object(raw: str, setting_name: str) -> dict[str, Any]:
 
 
 def _suppress_reasoning_text(content: str) -> str:
-    """Keep solution fences while removing provider-visible reasoning text."""
+    """Keep solution and self-test fences while removing reasoning text."""
 
     fences = list(_FENCED_CODE_RE.finditer(content))
     if fences:
@@ -130,7 +133,18 @@ def _suppress_reasoning_text(content: str) -> str:
             ),
             fences[0],
         )
-        return solution.group(0).strip()
+        self_tests = next(
+            (
+                match
+                for match in fences
+                if match.group("label").strip().lower() in _SELF_TEST_LABELS
+            ),
+            None,
+        )
+        retained = [solution.group(0).strip()]
+        if self_tests is not None and self_tests is not solution:
+            retained.insert(0, self_tests.group(0).strip())
+        return "\n\n".join(retained)
     return _REASONING_BLOCK_RE.sub("", content).strip()
 
 

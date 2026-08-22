@@ -4,7 +4,9 @@
 The first sample case is included as public context. Remaining cases are loaded
 as operator-owned local tests, so this exercises provider inference, optional
 self-review, fingerprint selection, the signed endpoint, and the configured
-language executor. The default selection covers all five samples.
+language executor. Pass ``--problem-only`` to hide every authored sample case
+from the miner and use them only for post-response reporting. The default
+selection covers all five samples.
 """
 
 from __future__ import annotations
@@ -29,6 +31,7 @@ from rlvr.neurons.demo_miner import (
     DemoMinerSettings,
     GLM52Client,
     build_demo_miner_app,
+    extract_generated_tests,
     extract_python,
     extract_rust,
     semantic_task_fingerprint,
@@ -165,10 +168,10 @@ class _TimedTester:
         self.inner = inner
         self.timeline = timeline
 
-    def run(self, request, code):
+    def run(self, request, code, generated_tests=None):
         started = time.perf_counter()
         try:
-            results = self.inner.run(request, code)
+            results = self.inner.run(request, code, generated_tests)
             self.timeline.test_results.append(results)
             return results
         finally:
@@ -224,13 +227,15 @@ def _request_for_sample(
     statement: str,
     cases: list[TestCase],
     deadline_s: float,
+    *,
+    problem_only: bool = False,
 ) -> TaskRequest:
     return TaskRequest(
         problem_id=f"sample-smoke-{name}",
         language=payload["language"],
         statement=statement,
         entrypoint=payload["entrypoint"],
-        public_examples=[cases[0]],
+        public_examples=[] if problem_only else [cases[0]],
         deadline_s=deadline_s,
     )
 
@@ -248,14 +253,17 @@ async def run_sample(
     run_id: str,
     log_file: Path,
     artifacts_root: Path,
+    *,
+    problem_only: bool,
 ) -> bool:
+    public_examples = [] if problem_only else [cases[0]]
     problem = Problem(
         problem_id=f"sample-smoke-{name}",
         language=payload["language"],
         statement=statement,
         entrypoint=payload["entrypoint"],
         tests=cases,
-        public_examples=[cases[0]],
+        public_examples=public_examples,
     )
     timeline.clear()
     sample_started_at = datetime.now(timezone.utc).isoformat()
@@ -269,10 +277,23 @@ async def run_sample(
     if miner.self_tester is None:  # pragma: no cover - fixed by build_provider
         raise RuntimeError("sample smoke test requires miner self-tests")
 
-    request = _request_for_sample(name, payload, statement, cases, deadline_s)
-    # Re-run through the same tester to report every sample case, including the
-    # operator-owned cases that were not sent to the model.
-    results = await asyncio.to_thread(miner.self_tester.run, request, solution.code)
+    request = _request_for_sample(
+        name,
+        payload,
+        statement,
+        cases,
+        deadline_s,
+        problem_only=problem_only,
+    )
+    # Authored cases are applied only after the signed response. Giving them to
+    # a fresh request as public examples avoids selecting the miner's local
+    # fingerprint corpus and keeps this reporting pass outside the solve loop.
+    report_request = request.model_copy(update={"public_examples": cases})
+    results = await asyncio.to_thread(
+        miner.self_tester.run,
+        report_request,
+        solution.code,
+    )
     sample_finished = time.perf_counter()
     passed = sum(result.passed for result in results)
     submit_status = "PASS" if not artifact.error else "FAIL"
@@ -350,16 +371,52 @@ async def run_sample(
         if timeline.ai_outputs
         else ""
     )
-    review_code = (
-        _extract_sample_code(payload["language"], timeline.ai_outputs[1])
-        if len(timeline.ai_outputs) > 1
-        else ""
-    )
+    repair_codes = [
+        _extract_sample_code(payload["language"], model_output)
+        for model_output in timeline.ai_outputs[1:]
+    ]
+    generated_tests: list[TestCase] = []
+    for model_output in timeline.ai_outputs:
+        generated_tests = extract_generated_tests(
+            request,
+            model_output,
+            max_cases=int(
+                getattr(miner.settings, "miner_self_test_max_generated_cases", 8)
+            ),
+        )
+        if generated_tests:
+            break
     code_files = {
+        "request": _write_code(
+            sample_artifacts / "request.json",
+            request.model_dump_json(indent=2),
+        ),
         "draft": _write_code(sample_artifacts / f"draft{suffix}", draft_code),
-        "review": _write_code(sample_artifacts / f"review{suffix}", review_code),
+        "review": _write_code(
+            sample_artifacts / f"review{suffix}",
+            repair_codes[0] if repair_codes else "",
+        ),
+        "repairs": [
+            _write_code(
+                sample_artifacts / f"repair_{index}{suffix}",
+                repair_code,
+            )
+            for index, repair_code in enumerate(repair_codes, 1)
+        ],
         "submitted": _write_code(
             sample_artifacts / f"submitted{suffix}", solution.code
+        ),
+        "generated_tests": _write_code(
+            sample_artifacts / "generated_tests.json",
+            json.dumps(
+                {
+                    "tests": [
+                        case.model_dump(mode="json") for case in generated_tests
+                    ]
+                },
+                ensure_ascii=False,
+                indent=2,
+            ),
         ),
     }
     accepted = (
@@ -377,6 +434,7 @@ async def run_sample(
             "sample": name,
             "language": payload["language"],
             "model": miner.model_name,
+            "problem_only": problem_only,
             "accepted": accepted,
             "response_bytes": len(solution.code.encode("utf-8")),
             "wire_latency_ms": round(submit_duration_ms, 3),
@@ -418,7 +476,8 @@ async def async_main(args: argparse.Namespace) -> int:
     run_started = time.perf_counter()
     print(
         f"run_id={run_id} provider={args.provider} samples={len(selected)} "
-        f"review={'on' if not args.no_review else 'off'}"
+        f"review={'on' if not args.no_review else 'off'} "
+        f"input={'problem-only' if args.problem_only else 'public-plus-local'}"
     )
     print(f"log_file={log_file}")
     print(f"artifacts_dir={artifacts_root / run_id}")
@@ -430,17 +489,25 @@ async def async_main(args: argparse.Namespace) -> int:
         for name in selected:
             payload, statement, cases, labels = load_sample(name)
             request = _request_for_sample(
-                name, payload, statement, cases, args.deadline
+                name,
+                payload,
+                statement,
+                cases,
+                args.deadline,
+                problem_only=args.problem_only,
             )
-            records.append(
-                json.dumps(
-                    {
-                        "task_fingerprint": semantic_task_fingerprint(request),
-                        "tests": [case.model_dump(mode="json") for case in cases[1:]],
-                    },
-                    separators=(",", ":"),
+            if not args.problem_only:
+                records.append(
+                    json.dumps(
+                        {
+                            "task_fingerprint": semantic_task_fingerprint(request),
+                            "tests": [
+                                case.model_dump(mode="json") for case in cases[1:]
+                            ],
+                        },
+                        separators=(",", ":"),
+                    )
                 )
-            )
             loaded.append((name, payload, statement, cases, labels))
         Path(tests_file).write_text("\n".join(records) + "\n", encoding="utf-8")
 
@@ -508,6 +575,7 @@ async def async_main(args: argparse.Namespace) -> int:
                         run_id,
                         log_file,
                         artifacts_root,
+                        problem_only=args.problem_only,
                     )
                 except Exception as error:  # noqa: BLE001 - continue remaining samples
                     outcome = False
@@ -552,6 +620,7 @@ async def async_main(args: argparse.Namespace) -> int:
             "run_id": run_id,
             "finished_at": datetime.now(timezone.utc).isoformat(),
             "provider": args.provider,
+            "problem_only": args.problem_only,
             "samples_passed": passed_samples,
             "samples_total": len(outcomes),
             "archive_ok": archive_ok,
@@ -594,6 +663,14 @@ def main() -> int:
         "--no-review",
         action="store_true",
         help="disable the second model verification request",
+    )
+    parser.add_argument(
+        "--problem-only",
+        action="store_true",
+        help=(
+            "send no authored cases to the miner; generated self-tests are the "
+            "only solve-time tests, and sample cases run afterward for reporting"
+        ),
     )
     parser.add_argument("--deadline", type=float, default=300.0)
     parser.add_argument("--self-test-timeout", type=float, default=5.0)

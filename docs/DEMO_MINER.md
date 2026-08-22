@@ -9,11 +9,12 @@ validator/miner wire protocol. It:
 4. extracts the Python solution and signs the exact response bytes with the
    miner hotkey.
 
-It does not receive hidden evaluation cases and does not execute generated
-code. Validators reveal tests only after committing miner responses, then run
-the code in their own sandboxes. Public task statements and examples are sent
-to the configured model provider, so operators should review that provider's
-data-handling terms.
+It does not receive hidden evaluation cases. It runs model-generated, public,
+and operator-owned preflight cases locally, while validators still reveal their
+private tests only after committing miner responses and execute the submitted
+code in separate validator sandboxes. Public task statements and examples are
+sent to the configured model provider, so operators should review that
+provider's data-handling terms.
 
 ## Prerequisites
 
@@ -86,8 +87,9 @@ MINER_MIN_STAKE=0
 MINER_MAX_CONCURRENT_REQUESTS=4
 MINER_MAX_REQUEST_BYTES=1000000
 MINER_TASK_ARCHIVE_FILE=data/miner_tasks.jsonl
-MINER_SELF_TEST=false
+MINER_SELF_TEST=true
 MINER_SELF_TEST_FILE=data/miner_tests.jsonl
+MINER_SELF_TEST_MAX_GENERATED_CASES=8
 MINER_SELF_TEST_EXECUTOR=docker
 MINER_SELF_TEST_TIMEOUT_S=5
 MINER_METAGRAPH_SYNC_S=300
@@ -108,30 +110,32 @@ GLM_REQUEST_TIMEOUT_S=280
 GLM_MAX_RETRIES=2
 MINER_SELF_VERIFY=true
 MINER_SELF_VERIFY_RESERVE_S=90
+MINER_SELF_VERIFY_MAX_ATTEMPTS=3
 ```
 
 Lower output or reasoning budgets reduce cost and latency, but may reduce the
 pass rate on harder tasks.
 
-The self-verification pass reuses the complete public task and first draft,
-checks the examples and prompt-derived boundary cases, and returns corrected
-source. The reserve bounds the first provider call so the review has time inside
-the validator deadline. If review fails or returns malformed source, the miner
-keeps the first draft. Review is stopped slightly early to leave wire time for
-that fallback draft. Disable it only when one-pass latency and provider cost
-matter more than the additional accuracy check.
+With self-tests enabled, the initial response contains source plus a generated
+fixed test suite. The miner executes that suite with public and operator-owned
+cases. A pass is returned immediately; a failure is sent back with test evidence
+for repair and retested, up to `MINER_SELF_VERIFY_MAX_ATTEMPTS` times while the
+request deadline permits. The tests stay fixed across repairs. Without an
+executed failing suite, self-verification retains its single independent review
+behavior.
 
 ## Local self-tests
 
-Set `MINER_SELF_TEST=true` to run the candidate against public examples and any
-operator-owned cases matching its task fingerprint in `MINER_SELF_TEST_FILE`.
-The file is JSONL:
+`MINER_SELF_TEST=true` runs the model-generated suite, public examples, and any
+operator-owned cases matching the task fingerprint in `MINER_SELF_TEST_FILE`.
+The operator file is JSONL:
 
 ```json
 {"task_fingerprint":"<sha256>","tests":[{"args":[2,3],"kwargs":{},"expected":5}]}
 ```
 
-The default executor is Docker with no network and bounded resources. The
+Generated cases are preflight heuristics, not validator hidden tests. The
+default executor is Docker with no network and bounded resources. The
 `subprocess` executor is available for local development only; it is not a full
 Linux security boundary. A failed local test rejects the candidate, while an
 unavailable self-test sandbox is logged and treated as inconclusive.
@@ -165,3 +169,16 @@ times, local-test times, signed-response latency, and per-case results. Use
 solution fails its sample cases. Structured results are appended to
 `data/miner_sample_smoke.jsonl`; generated draft, review, and submitted source
 files are retained under `data/miner_sample_smoke_artifacts/<run-id>/`.
+
+To test generation from the statement alone, hide every authored sample case
+from the miner:
+
+```bash
+PYTHONPATH=. .venv/bin/python scripts/smoke_miner_samples.py \
+  --provider glm --example extent-journal --problem-only
+```
+
+The authored cases run only after the signed response as an external accuracy
+report. The generated suite is saved as `generated_tests.json` beside the draft
+and submitted source artifacts. `request.json` confirms that
+`public_examples` was empty, and `repair_N.*` files retain each loop candidate.

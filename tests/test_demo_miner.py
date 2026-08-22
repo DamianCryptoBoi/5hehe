@@ -18,6 +18,7 @@ from rlvr.neurons.demo_miner import (
     build_demo_miner_app,
     build_model_messages,
     build_verification_messages,
+    extract_generated_tests,
     extract_python,
     semantic_task_fingerprint,
 )
@@ -101,12 +102,13 @@ class SlowReviewGLM(SequencedGLM):
 
 
 def demo_settings(**updates) -> DemoMinerSettings:
-    return DemoMinerSettings(
-        _env_file=None,
-        glm_api_key="test-key",
-        miner_require_validator_permit=True,
-        **updates,
-    )
+    values = {
+        "glm_api_key": "test-key",
+        "miner_require_validator_permit": True,
+        "miner_self_test": False,
+    }
+    values.update(updates)
+    return DemoMinerSettings(_env_file=None, **values)
 
 
 def test_extract_python_prefers_python_fence():
@@ -208,7 +210,11 @@ def test_local_test_corpus_loads_cases_by_task_fingerprint(tmp_path):
 
 
 async def test_local_self_test_rejects_wrong_code_with_subprocess(tmp_path):
-    client = FakeGLM("```python\ndef add(a, b):\n    return a - b\n```")
+    client = FakeGLM(
+        "```self-tests\n"
+        '{"tests":[{"args":[2,3],"kwargs":{},"expected":5}]}\n'
+        "```\n```python\ndef add(a, b):\n    return a - b\n```"
+    )
     miner = DemoMiner(
         demo_settings(
             miner_self_test=True,
@@ -233,7 +239,11 @@ async def test_local_self_test_rejects_wrong_code_with_subprocess(tmp_path):
 
 
 async def test_local_self_test_accepts_code_that_passes_public_examples(tmp_path):
-    client = FakeGLM("```python\ndef add(a, b):\n    return a + b\n```")
+    client = FakeGLM(
+        "```self-tests\n"
+        '{"tests":[{"args":[2,3],"kwargs":{},"expected":5}]}\n'
+        "```\n```python\ndef add(a, b):\n    return a + b\n```"
+    )
     miner = DemoMiner(
         demo_settings(
             miner_self_test=True,
@@ -257,7 +267,11 @@ async def test_local_self_test_accepts_code_that_passes_public_examples(tmp_path
 
 
 async def test_local_self_test_allows_review_repair(tmp_path):
-    draft = "```python\ndef add(a, b):\n    return a - b\n```"
+    draft = (
+        "```self-tests\n"
+        '{"tests":[{"args":[2,3],"kwargs":{},"expected":5}]}\n'
+        "```\n```python\ndef add(a, b):\n    return a - b\n```"
+    )
     corrected = "```python\ndef add(a, b):\n    return a + b\n```"
     client = SequencedGLM(draft, corrected)
     miner = DemoMiner(
@@ -281,6 +295,162 @@ async def test_local_self_test_allows_review_repair(tmp_path):
     assert payload.code == "def add(a, b):\n    return a + b"
     assert payload.raw_response == corrected
     assert "test 0" in client.calls[1][0][-1]["content"]
+
+
+def test_generated_self_tests_are_validated_and_bounded():
+    request = TaskRequest(
+        problem_id="p",
+        language="rust",
+        statement="Echo stdin.",
+        entrypoint="main",
+    )
+    raw = """```self-tests
+{"tests":[
+  {"args":["hello\\n"],"kwargs":{},"expected":"hello\\n"},
+  {"args":[1],"kwargs":{},"expected":"1"},
+  {"args":["ignored"],"kwargs":{},"expected":"ignored"}
+]}
+```
+```rust
+fn main() {}
+```"""
+
+    tests = extract_generated_tests(request, raw, max_cases=2)
+
+    assert tests == [Case(args=["hello\n"], kwargs={}, expected="hello\n")]
+
+
+async def test_passing_generated_self_tests_send_without_review(tmp_path):
+    initial = """```self-tests
+{"tests":[{"args":[-2,5],"kwargs":{},"expected":3}]}
+```
+```python
+def add(a, b):
+    return a + b
+```"""
+    client = SequencedGLM(initial)
+    miner = DemoMiner(
+        demo_settings(
+            miner_self_test=True,
+            miner_self_test_executor="subprocess",
+            miner_self_test_file=str(tmp_path / "missing.jsonl"),
+        ),
+        client,
+    )
+    request = TaskRequest(
+        problem_id="p",
+        language="python",
+        statement="Return the sum of two integers.",
+        entrypoint="add",
+    )
+
+    payload = await miner.solve(request, timeout_s=30.0)
+
+    assert payload.code == "def add(a, b):\n    return a + b"
+    assert len(client.calls) == 1
+    assert "`self-tests` JSON block" in client.calls[0][0][0]["content"]
+
+
+async def test_missing_generated_self_tests_are_restored_before_acceptance(tmp_path):
+    initial = "```python\ndef add(a, b):\n    return a + b\n```"
+    repaired = """```self-tests
+{"tests":[{"args":[-2,5],"kwargs":{},"expected":3}]}
+```
+```python
+def add(a, b):
+    return a + b
+```"""
+    client = SequencedGLM(initial, repaired)
+    miner = DemoMiner(
+        demo_settings(
+            miner_self_test=True,
+            miner_self_test_executor="subprocess",
+            miner_self_test_file=str(tmp_path / "missing.jsonl"),
+        ),
+        client,
+    )
+    request = TaskRequest(
+        problem_id="p",
+        language="python",
+        statement="Return the sum of two integers.",
+        entrypoint="add",
+    )
+
+    payload = await miner.solve(request, timeout_s=30.0)
+
+    assert payload.code == "def add(a, b):\n    return a + b"
+    assert len(client.calls) == 2
+    assert "omitted a valid generated self-test" in client.calls[1][0][-1]["content"]
+    assert "`self-tests` JSON block" in client.calls[1][0][0]["content"]
+
+
+async def test_failed_generated_self_tests_loop_until_repair_passes(tmp_path):
+    initial = """```self-tests
+{"tests":[{"args":[-2,5],"kwargs":{},"expected":3}]}
+```
+```python
+def add(a, b):
+    return abs(a) + abs(b)
+```"""
+    still_wrong = "```python\ndef add(a, b):\n    return a - b\n```"
+    corrected = "```python\ndef add(a, b):\n    return a + b\n```"
+    client = SequencedGLM(initial, still_wrong, corrected)
+    miner = DemoMiner(
+        demo_settings(
+            miner_self_test=True,
+            miner_self_test_executor="subprocess",
+            miner_self_test_file=str(tmp_path / "missing.jsonl"),
+            miner_self_verify_max_attempts=3,
+        ),
+        client,
+    )
+    request = TaskRequest(
+        problem_id="p",
+        language="python",
+        statement="Return the sum of two integers.",
+        entrypoint="add",
+    )
+
+    payload = await miner.solve(request, timeout_s=30.0)
+
+    assert payload.code == "def add(a, b):\n    return a + b"
+    assert len(client.calls) == 3
+    assert "fixed self-test suite" in client.calls[1][0][-1]["content"]
+    assert "return a - b" in client.calls[2][0][-2]["content"]
+    assert "test 0" in client.calls[2][0][-1]["content"]
+
+
+async def test_failed_generated_self_tests_stop_at_attempt_cap(tmp_path):
+    initial = """```self-tests
+{"tests":[{"args":[2,5],"kwargs":{},"expected":7}]}
+```
+```python
+def add(a, b):
+    return 0
+```"""
+    wrong = "```python\ndef add(a, b):\n    return 1\n```"
+    client = SequencedGLM(initial, wrong, wrong)
+    miner = DemoMiner(
+        demo_settings(
+            miner_self_test=True,
+            miner_self_test_executor="subprocess",
+            miner_self_test_file=str(tmp_path / "missing.jsonl"),
+            miner_self_verify_max_attempts=2,
+        ),
+        client,
+    )
+    request = TaskRequest(
+        problem_id="p",
+        language="python",
+        statement="Return the sum of two integers.",
+        entrypoint="add",
+    )
+
+    payload = await miner.solve(request, timeout_s=30.0)
+
+    assert payload.code == ""
+    assert payload.raw_response.startswith("<local self-test failed>")
+    assert len(client.calls) == 3
 
 
 def test_model_prompt_contains_only_public_task_data():
