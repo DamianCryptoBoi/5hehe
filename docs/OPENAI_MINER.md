@@ -68,11 +68,11 @@ is convenient when both models are served by the same provider. Use a separate
 key when the URLs belong to different providers.
 
 When configured, the primary and fallback endpoints are called concurrently
-with the same absolute request deadline and retry policy. The first valid
-completion is used; if both complete in the same event-loop turn, the primary
-result is preferred. This means a healthy fallback can answer immediately when
-the primary is slow or unavailable, without waiting for the primary retries to
-exhaust first.
+with the same absolute request deadline and retry policy. The primary result is
+authoritative: it is always used when the primary succeeds, even if the
+fallback finishes first. A fallback result is used only after the primary
+request fails, so a healthy fallback can still provide failover without
+replacing a successful primary response.
 
 The default omits `temperature` and `reasoning_effort` because those optional
 fields are not uniformly supported by compatible servers. Configure them only

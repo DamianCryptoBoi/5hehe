@@ -104,7 +104,7 @@ An OpenAI-compatible miner is included for operators. It preserves the signed
 Hone wire protocol while sending public coding tasks to a configurable
 `POST /chat/completions` endpoint. It requires `OPENAI_MODEL` and normally an
 `OPENAI_API_KEY`; an optional second URL/model can be queried concurrently and
-provide the response when the primary is slow or fails. Validators do not need
+provide the response if the primary fails. Validators do not need
 a model-provider key. See
 [`docs/OPENAI_MINER.md`](docs/OPENAI_MINER.md).
 

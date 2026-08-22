@@ -296,15 +296,63 @@ async def test_hedged_fallback_runs_concurrently_with_primary(monkeypatch):
     ) == 1
 
 
-async def test_hedged_fallback_starts_before_primary_finishes():
+async def test_hedged_fallback_is_used_only_after_primary_fails():
+    primary_started = asyncio.Event()
     fallback_started = asyncio.Event()
+    release_primary = asyncio.Event()
 
     async def handler(request: httpx.Request) -> httpx.Response:
         if request.url.host == "primary.example":
             # The primary is still in flight while the fallback gets its turn.
+            primary_started.set()
             await fallback_started.wait()
+            await release_primary.wait()
             return httpx.Response(503, json={"error": "primary unavailable"})
         fallback_started.set()
+        return httpx.Response(
+            200,
+            json={"choices": [{"message": {"content": "fallback code"}}]},
+        )
+
+    settings = miner_settings(
+        openai_base_url="https://primary.example/v1",
+        openai_model="primary/model",
+        openai_max_retries=0,
+        openai_fallback_base_url="https://fallback.example/v1",
+        openai_fallback_model="fallback/model",
+    )
+    http = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    client = OpenAICompatibleClient(settings, http=http)
+    try:
+        request = asyncio.create_task(client.complete([], timeout_s=30.0))
+        await asyncio.wait_for(
+            asyncio.gather(primary_started.wait(), fallback_started.wait()),
+            timeout=2.0,
+        )
+        assert not request.done()
+        release_primary.set()
+        content = await request
+    finally:
+        await http.aclose()
+
+    assert content == "fallback code"
+    assert fallback_started.is_set()
+
+
+async def test_primary_result_is_used_even_when_fallback_finishes_first():
+    primary_started = asyncio.Event()
+    fallback_finished = asyncio.Event()
+    release_primary = asyncio.Event()
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.host == "primary.example":
+            primary_started.set()
+            await release_primary.wait()
+            return httpx.Response(
+                200,
+                json={"choices": [{"message": {"content": "primary code"}}]},
+            )
+        fallback_finished.set()
         return httpx.Response(
             200,
             json={"choices": [{"message": {"content": "fallback code"}}]},
@@ -319,15 +367,18 @@ async def test_hedged_fallback_starts_before_primary_finishes():
     http = httpx.AsyncClient(transport=httpx.MockTransport(handler))
     client = OpenAICompatibleClient(settings, http=http)
     try:
-        content = await asyncio.wait_for(
-            client.complete([], timeout_s=30.0),
+        request = asyncio.create_task(client.complete([], timeout_s=30.0))
+        await asyncio.wait_for(
+            asyncio.gather(primary_started.wait(), fallback_finished.wait()),
             timeout=2.0,
         )
+        assert not request.done()
+        release_primary.set()
+        content = await request
     finally:
         await http.aclose()
 
-    assert content == "fallback code"
-    assert fallback_started.is_set()
+    assert content == "primary code"
 
 
 async def test_successful_primary_is_preferred_when_both_hedged_requests_succeed():

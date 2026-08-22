@@ -495,11 +495,11 @@ class OpenAICompatibleClient:
                 deadline_at=deadline_at,
             )
 
-        # Hedge the two providers under the same absolute deadline. The first
-        # valid completion wins; if both finish in the same event-loop turn,
-        # prefer the primary result. This lets a healthy fallback answer when
-        # the primary is slow or unavailable instead of waiting for its retries
-        # to exhaust first.
+        # Start both providers under the same absolute deadline. The primary
+        # remains authoritative: even if the fallback finishes first, wait for
+        # the primary to finish before deciding whether its result can be used.
+        # This keeps the requests concurrent without allowing a speculative
+        # fallback response to replace a successful primary response.
         primary_task = asyncio.create_task(
             self._complete_target(
                 messages,
@@ -518,39 +518,28 @@ class OpenAICompatibleClient:
                 deadline_at=deadline_at,
             )
         )
-        pending: set[asyncio.Task[str]] = {primary_task, fallback_task}
         errors: list[Exception] = []
-        missing = object()
         try:
-            while pending:
-                done, pending = await asyncio.wait(
-                    pending,
-                    return_when=asyncio.FIRST_COMPLETED,
-                )
-                primary_result: object = missing
-                fallback_result: object = missing
-                if primary_task in done:
-                    try:
-                        primary_result = primary_task.result()
-                    except Exception as exc:  # noqa: BLE001 - try the hedge
-                        errors.append(exc)
-                if fallback_task in done:
-                    try:
-                        fallback_result = fallback_task.result()
-                    except Exception as exc:  # noqa: BLE001 - try the primary
-                        errors.append(exc)
+            try:
+                # Await the authoritative result first. The fallback task is
+                # already in flight and is only consulted if this fails.
+                return await primary_task
+            except Exception as exc:  # noqa: BLE001 - use fallback on failure
+                errors.append(exc)
 
-                if primary_result is not missing:
-                    return primary_result  # type: ignore[return-value]
-                if fallback_result is not missing:
-                    print(
-                        f"[{self.log_prefix}] fallback provider supplied hedged response"
-                        f" request={request_label or '<unknown>'}"
-                        f" elapsed_s={time.monotonic() - started_at:.3f}"
-                        f" remaining_s={max(0.0, overall_deadline - time.monotonic()):.3f}"
-                        f" deadline_at={deadline_at}"
-                    )
-                    return fallback_result  # type: ignore[return-value]
+            try:
+                fallback_result = await fallback_task
+            except Exception as exc:  # noqa: BLE001 - report both failures
+                errors.append(exc)
+            else:
+                print(
+                    f"[{self.log_prefix}] fallback provider supplied hedged response"
+                    f" request={request_label or '<unknown>'}"
+                    f" elapsed_s={time.monotonic() - started_at:.3f}"
+                    f" remaining_s={max(0.0, overall_deadline - time.monotonic()):.3f}"
+                    f" deadline_at={deadline_at}"
+                )
+                return fallback_result
 
             detail = "; ".join(
                 f"{type(exc).__name__}: {_log_value(exc)}" for exc in errors
