@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 
 import httpx
@@ -247,7 +248,7 @@ async def test_explicit_local_server_can_run_without_authentication():
     assert captured["authorization"] is None
 
 
-async def test_fallback_runs_only_after_primary_retries_are_exhausted(monkeypatch):
+async def test_hedged_fallback_runs_concurrently_with_primary(monkeypatch):
     calls = []
 
     async def no_retry_delay(_seconds: float) -> None:
@@ -289,15 +290,47 @@ async def test_fallback_runs_only_after_primary_retries_are_exhausted(monkeypatc
         await http.aclose()
 
     assert content == "fallback code"
-    assert calls == [
-        ("primary.example", "primary/model", "Bearer test-key"),
-        ("primary.example", "primary/model", "Bearer test-key"),
-        ("primary.example", "primary/model", "Bearer test-key"),
-        ("fallback.example", "fallback/model", "Bearer fallback-key"),
-    ]
+    assert calls.count(("primary.example", "primary/model", "Bearer test-key")) == 3
+    assert calls.count(
+        ("fallback.example", "fallback/model", "Bearer fallback-key")
+    ) == 1
 
 
-async def test_successful_primary_never_calls_configured_fallback():
+async def test_hedged_fallback_starts_before_primary_finishes():
+    fallback_started = asyncio.Event()
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.host == "primary.example":
+            # The primary is still in flight while the fallback gets its turn.
+            await fallback_started.wait()
+            return httpx.Response(503, json={"error": "primary unavailable"})
+        fallback_started.set()
+        return httpx.Response(
+            200,
+            json={"choices": [{"message": {"content": "fallback code"}}]},
+        )
+
+    settings = miner_settings(
+        openai_base_url="https://primary.example/v1",
+        openai_model="primary/model",
+        openai_fallback_base_url="https://fallback.example/v1",
+        openai_fallback_model="fallback/model",
+    )
+    http = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    client = OpenAICompatibleClient(settings, http=http)
+    try:
+        content = await asyncio.wait_for(
+            client.complete([], timeout_s=30.0),
+            timeout=2.0,
+        )
+    finally:
+        await http.aclose()
+
+    assert content == "fallback code"
+    assert fallback_started.is_set()
+
+
+async def test_successful_primary_is_preferred_when_both_hedged_requests_succeed():
     hosts = []
 
     async def handler(request: httpx.Request) -> httpx.Response:
@@ -320,7 +353,7 @@ async def test_successful_primary_never_calls_configured_fallback():
         await http.aclose()
 
     assert content == "primary code"
-    assert hosts == ["primary.example"]
+    assert sorted(hosts) == ["fallback.example", "primary.example"]
 
 
 async def test_failure_is_terminal_after_fallback_retries_are_exhausted(

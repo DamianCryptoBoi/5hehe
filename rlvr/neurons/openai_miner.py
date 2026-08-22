@@ -60,6 +60,8 @@ class OpenAICompatibleSettings(BaseSettings):
     openai_fallback_base_url: str = ""
     openai_fallback_model: str = ""
     openai_fallback_api_key: str = ""
+    # Deprecated compatibility setting. Hedged fallback requests start at the
+    # same time as primary requests, so no reserve is applied.
     openai_fallback_reserve_s: float = Field(default=60.0, ge=0.0, le=1800.0)
     openai_allow_insecure_http: bool = False
     openai_extra_headers_json: str = "{}"
@@ -373,37 +375,77 @@ class OpenAICompatibleClient:
             raise TimeoutError("OpenAI-compatible request deadline exceeded")
         overall_deadline = time.monotonic() + budget_s
         fallback = self._fallback_target()
-        primary_deadline = overall_deadline
-        if fallback is not None:
-            reserve_s = min(
-                self.settings.openai_fallback_reserve_s,
-                budget_s / 2.0,
-            )
-            primary_deadline -= reserve_s
-
-        try:
+        primary = self._primary_target()
+        if fallback is None:
             return await self._complete_target(
                 messages,
-                target=self._primary_target(),
-                deadline=primary_deadline,
+                target=primary,
+                deadline=overall_deadline,
             )
-        except Exception as primary_error:  # noqa: BLE001 - fail over once
-            if fallback is None:
-                raise
-            print(
-                "[openai-miner] primary provider exhausted; trying fallback "
-                f"({type(primary_error).__name__})"
+
+        # Hedge the two providers under the same absolute deadline. The first
+        # valid completion wins; if both finish in the same event-loop turn,
+        # prefer the primary result. This lets a healthy fallback answer when
+        # the primary is slow or unavailable instead of waiting for its retries
+        # to exhaust first.
+        primary_task = asyncio.create_task(
+            self._complete_target(
+                messages,
+                target=primary,
+                deadline=overall_deadline,
             )
-            try:
-                return await self._complete_target(
-                    messages,
-                    target=fallback,
-                    deadline=overall_deadline,
+        )
+        fallback_task = asyncio.create_task(
+            self._complete_target(
+                messages,
+                target=fallback,
+                deadline=overall_deadline,
+            )
+        )
+        pending: set[asyncio.Task[str]] = {primary_task, fallback_task}
+        errors: list[Exception] = []
+        missing = object()
+        try:
+            while pending:
+                done, pending = await asyncio.wait(
+                    pending,
+                    return_when=asyncio.FIRST_COMPLETED,
                 )
-            except Exception as fallback_error:  # noqa: BLE001 - terminal failure
-                raise RuntimeError(
-                    "primary and fallback OpenAI-compatible providers failed"
-                ) from fallback_error
+                primary_result: object = missing
+                fallback_result: object = missing
+                if primary_task in done:
+                    try:
+                        primary_result = primary_task.result()
+                    except Exception as exc:  # noqa: BLE001 - try the hedge
+                        errors.append(exc)
+                if fallback_task in done:
+                    try:
+                        fallback_result = fallback_task.result()
+                    except Exception as exc:  # noqa: BLE001 - try the primary
+                        errors.append(exc)
+
+                if primary_result is not missing:
+                    return primary_result  # type: ignore[return-value]
+                if fallback_result is not missing:
+                    print(
+                        "[openai-miner] fallback provider supplied hedged "
+                        "response"
+                    )
+                    return fallback_result  # type: ignore[return-value]
+
+            error = RuntimeError(
+                "primary and fallback OpenAI-compatible providers failed"
+            )
+            raise error from (errors[-1] if errors else None)
+        finally:
+            for task in (primary_task, fallback_task):
+                if not task.done():
+                    task.cancel()
+            await asyncio.gather(
+                primary_task,
+                fallback_task,
+                return_exceptions=True,
+            )
 
     async def aclose(self) -> None:
         if self._owns_http:

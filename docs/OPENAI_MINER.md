@@ -45,7 +45,6 @@ MINER_SELF_VERIFY_RESERVE_S=90
 OPENAI_FALLBACK_BASE_URL=https://second-provider.example/v1
 OPENAI_FALLBACK_MODEL=<fallback-chat-completions-model-id>
 OPENAI_FALLBACK_API_KEY=<fallback-provider-key>
-OPENAI_FALLBACK_RESERVE_S=60
 
 NETUID=5
 SUBTENSOR_NETWORK=finney
@@ -68,13 +67,12 @@ is optional: an empty `OPENAI_FALLBACK_API_KEY` reuses `OPENAI_API_KEY`, which
 is convenient when both models are served by the same provider. Use a separate
 key when the URLs belong to different providers.
 
-The primary endpoint receives the first attempt and all retries. Only after it
-has exhausted that policy does the client call the fallback endpoint. The
-fallback uses the same `OPENAI_MAX_RETRIES` policy. A fast primary failure
-leaves almost the entire request budget for fallback; a slow primary cannot
-consume the last `OPENAI_FALLBACK_RESERVE_S` seconds. The reserve is capped at
-half of the actual validator/provider budget, and setting it to `0` disables
-the reservation without disabling fallback.
+When configured, the primary and fallback endpoints are called concurrently
+with the same absolute request deadline and retry policy. The first valid
+completion is used; if both complete in the same event-loop turn, the primary
+result is preferred. This means a healthy fallback can answer immediately when
+the primary is slow or unavailable, without waiting for the primary retries to
+exhaust first.
 
 The default omits `temperature` and `reasoning_effort` because those optional
 fields are not uniformly supported by compatible servers. Configure them only
@@ -204,6 +202,6 @@ MINER_METAGRAPH_SYNC_S=300
 Provider calls use one absolute budget bounded by both the validator's task
 deadline and `OPENAI_REQUEST_TIMEOUT_S`. HTTP 408, 409, 429, and 5xx responses,
 timeouts, and network transport failures are retried with short exponential
-backoff within that same budget. Other terminal primary errors also trigger
-fallback immediately. If fallback also fails, the miner returns a valid signed
-empty solution, which safely scores zero without breaking the validator round.
+backoff within that same budget. If both concurrent providers fail, the miner
+returns a valid signed empty solution, which safely scores zero without breaking
+the validator round.
