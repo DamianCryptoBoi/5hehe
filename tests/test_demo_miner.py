@@ -481,6 +481,8 @@ def test_rust_task_prompts_for_a_complete_program():
     assert "standard input" in RUST_SYSTEM_PROMPT
     assert "held-out-test" in RUST_SYSTEM_PROMPT
     assert "boundary cases" in RUST_SYSTEM_PROMPT
+    assert "Infer the problem's subject" in RUST_SYSTEM_PROMPT
+    assert "actual constraints" in RUST_SYSTEM_PROMPT
     assert "exactly one complete fenced `rust`" in RUST_SYSTEM_PROMPT
     # Program mode names main as metadata without Python-specific function prose.
     assert "Required function name" not in messages[1]["content"]
@@ -504,6 +506,8 @@ def test_python_prompt_is_unchanged_when_language_is_omitted():
     assert "held-out-test" in PYTHON_SYSTEM_PROMPT
     assert "boundary cases" in PYTHON_SYSTEM_PROMPT
     assert "deterministic" in PYTHON_SYSTEM_PROMPT
+    assert "Infer the problem's subject" in PYTHON_SYSTEM_PROMPT
+    assert "actual constraints" in PYTHON_SYSTEM_PROMPT
     assert "exactly one complete fenced `python`" in PYTHON_SYSTEM_PROMPT
     assert "<public_examples_json>[]</public_examples_json>" in messages[1][
         "content"
@@ -517,3 +521,21 @@ def test_rust_fence_is_preferred_over_other_fences():
     assert extract_rust(both) == "fn main() {}"
     assert extract_rust("```\nfn main() {}\n```") == "fn main() {}"
     assert extract_python("```python\nx = 1\n```") == "x = 1"
+
+
+def test_language_prompts_do_not_fix_the_subject_to_sample_domains():
+    from rlvr.neurons.demo_miner import PYTHON_SYSTEM_PROMPT, RUST_SYSTEM_PROMPT
+
+    sample_specific_terms = (
+        "asset",
+        "cache validity",
+        "cryptographic",
+        "extent",
+        "quota",
+        "revocation",
+        "reactive DAG",
+        "circular sparse",
+    )
+    for prompt in (PYTHON_SYSTEM_PROMPT, RUST_SYSTEM_PROMPT):
+        lowered = prompt.lower()
+        assert all(term.lower() not in lowered for term in sample_specific_terms)
