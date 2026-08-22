@@ -24,7 +24,7 @@ from .demo_miner import DemoMiner, build_demo_miner_app
 
 
 _FENCED_CODE_RE = re.compile(
-    r"```(?P<label>[^\n`]*)\n.*?```",
+    r"```(?P<label>[^\n`]*)\n(?P<body>.*?)```",
     re.DOTALL,
 )
 _SELF_TEST_LABELS = {"self-tests", "self_tests"}
@@ -133,19 +133,27 @@ def _suppress_reasoning_text(content: str) -> str:
             ),
             fences[0],
         )
-        self_tests = next(
-            (
-                match
-                for match in fences
-                if match.group("label").strip().lower() in _SELF_TEST_LABELS
-            ),
-            None,
-        )
+        self_tests = next((match for match in fences if _is_self_tests(match)), None)
         retained = [solution.group(0).strip()]
         if self_tests is not None and self_tests is not solution:
             retained.insert(0, self_tests.group(0).strip())
         return "\n\n".join(retained)
     return _REASONING_BLOCK_RE.sub("", content).strip()
+
+
+def _is_self_tests(match: re.Match[str]) -> bool:
+    """Recognize explicit or schema-valid generic JSON self-test fences."""
+
+    label = match.group("label").strip().lower()
+    if label in _SELF_TEST_LABELS:
+        return True
+    if label != "json":
+        return False
+    try:
+        payload = json.loads(match.group("body"))
+    except json.JSONDecodeError:
+        return False
+    return isinstance(payload, dict) and isinstance(payload.get("tests"), list)
 
 
 @dataclass(frozen=True)

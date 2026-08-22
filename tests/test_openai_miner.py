@@ -126,6 +126,16 @@ async def test_chat_completion_contract_and_auth_header():
             "```\n\n"
             "```python\ndef add(a, b):\n    return a + b\n```",
         ),
+        (
+            "```json\n"
+            '{"tests":[{"args":[1,2],"kwargs":{},"expected":3}]}\n'
+            "```\n"
+            "```python\ndef add(a, b):\n    return a + b\n```",
+            "```json\n"
+            '{"tests":[{"args":[1,2],"kwargs":{},"expected":3}]}\n'
+            "```\n\n"
+            "```python\ndef add(a, b):\n    return a + b\n```",
+        ),
     ],
 )
 async def test_reasoning_text_is_suppressed_from_completion(

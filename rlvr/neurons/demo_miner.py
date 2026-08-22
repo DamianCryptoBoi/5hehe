@@ -96,7 +96,7 @@ _PYTHON_FENCE_RE = re.compile(
 _RUST_FENCE_RE = re.compile(r"```rust\s*\n(.*?)```", re.IGNORECASE | re.DOTALL)
 _ANY_FENCE_RE = re.compile(r"```[^\n`]*\n(.*?)```", re.DOTALL)
 _SELF_TEST_FENCE_RE = re.compile(
-    r"```(?:self-tests|self_tests)\s*\n(.*?)```",
+    r"```(?:self-tests|self_tests|json)\s*\n(.*?)```",
     re.IGNORECASE | re.DOTALL,
 )
 _REVIEW_RESPONSE_MARGIN_S = 0.5
@@ -349,26 +349,71 @@ def extract_rust(text: str) -> str:
     return (match.group(1) if match else text).strip()
 
 
-def _self_test_output_contract(request: TaskRequest, max_cases: int) -> str:
+def _self_test_output_contract(
+    request: TaskRequest,
+    max_cases: int,
+    *,
+    tests_only: bool = False,
+) -> str:
     case_shape = (
         '{"args":["complete stdin"],"kwargs":{},"expected":"complete stdout"}'
         if request.language == "rust"
         else '{"args":[],"kwargs":{},"expected":null}'
     )
-    language = "rust" if request.language == "rust" else "python"
-    return (
-        "Generate a compact self-test suite from the statement before writing "
-        "the implementation. Cover normal, boundary, and adversarial behavior "
+    sequence = "" if tests_only else " before writing the implementation"
+    instructions = (
+        f"Generate a compact self-test suite from the statement{sequence}. "
+        "Cover normal, boundary, and adversarial behavior "
         "not already covered by the public examples. Derive expected results "
         "from the specification, independently of the implementation. Use only "
         "JSON-serializable values and do not include invalid inputs unless the "
         f"statement defines their behavior. Generate between 1 and {max_cases} "
         "cases.\n\n"
-        "Output exactly two fenced blocks and no prose. The first must be a "
-        "`self-tests` JSON block of this form:\n"
-        f'{{"tests":[{case_shape}]}}\n'
-        f"The second must be the complete fenced `{language}` solution."
     )
+    test_block = (
+        "`self-tests` JSON block of this form:\n"
+        f'{{"tests":[{case_shape}]}}'
+    )
+    if tests_only:
+        return (
+            instructions
+            + "Output exactly one fenced block and no prose: a "
+            + test_block
+        )
+    language = "rust" if request.language == "rust" else "python"
+    return (
+        instructions
+        + "Output exactly two fenced blocks and no prose. The first must be a "
+        + test_block
+        + f"\nThe second must be the complete fenced `{language}` solution."
+    )
+
+
+def build_self_test_messages(
+    request: TaskRequest,
+    *,
+    max_self_test_cases: int = 8,
+) -> list[dict[str, str]]:
+    """Request only an independent executable test suite from the model."""
+
+    task_messages = build_model_messages(request)
+    return [
+        {
+            "role": "system",
+            "content": (
+                "You are an independent test designer for a coding challenge. "
+                "Do not generate an implementation. Derive small, exact cases "
+                "directly from the specification; favor cases whose expected "
+                "results can be checked manually.\n\n"
+                + _self_test_output_contract(
+                    request,
+                    max_self_test_cases,
+                    tests_only=True,
+                )
+            ),
+        },
+        task_messages[1],
+    ]
 
 
 def build_model_messages(
@@ -429,28 +474,45 @@ def extract_generated_tests(
 ) -> list[TestCase]:
     """Parse and validate the model's optional fixed self-test suite."""
 
-    match = _SELF_TEST_FENCE_RE.search(raw)
-    if match is None:
-        return []
+    for match in _SELF_TEST_FENCE_RE.finditer(raw):
+        try:
+            payload = json.loads(match.group(1))
+        except json.JSONDecodeError:
+            continue
+        tests = _test_cases_from_payload(request, payload, max_cases=max_cases)
+        if tests:
+            return tests
     try:
-        payload = json.loads(match.group(1))
-        raw_tests = payload.get("tests") if isinstance(payload, dict) else None
-        if not isinstance(raw_tests, list):
-            return []
-        tests: list[TestCase] = []
-        for item in raw_tests[:max_cases]:
-            case = TestCase.model_validate(item)
-            if request.language == "rust" and not (
-                len(case.args) == 1
-                and isinstance(case.args[0], str)
-                and not case.kwargs
-                and isinstance(case.expected, str)
-            ):
-                continue
-            tests.append(case)
-        return tests
-    except (json.JSONDecodeError, TypeError, ValueError):
+        payload = json.loads(raw.strip())
+    except json.JSONDecodeError:
         return []
+    return _test_cases_from_payload(request, payload, max_cases=max_cases)
+
+
+def _test_cases_from_payload(
+    request: TaskRequest,
+    payload: Any,
+    *,
+    max_cases: int,
+) -> list[TestCase]:
+    raw_tests = payload.get("tests") if isinstance(payload, dict) else None
+    if not isinstance(raw_tests, list):
+        return []
+    tests: list[TestCase] = []
+    for item in raw_tests[:max_cases]:
+        try:
+            case = TestCase.model_validate(item)
+        except (TypeError, ValueError):
+            continue
+        if request.language == "rust" and not (
+            len(case.args) == 1
+            and isinstance(case.args[0], str)
+            and not case.kwargs
+            and isinstance(case.expected, str)
+        ):
+            continue
+        tests.append(case)
+    return tests
 
 
 def build_verification_messages(
@@ -773,6 +835,17 @@ class DemoMiner:
             max_cases=max_generated_cases,
         )
         require_generated_tests = self.self_tester is not None
+        if require_generated_tests and not generated_tests:
+            remaining_s = deadline - time.monotonic()
+            test_generation_budget_s = min(
+                max(0.001, remaining_s - _response_margin(remaining_s)),
+                max(1.0, reserve_s / 2.0),
+            )
+            generated_tests = await self._generate_self_tests(
+                request,
+                max_cases=max_generated_cases,
+                budget_s=test_generation_budget_s,
+            )
         draft_failures = await self._local_test_failures(
             request,
             draft_code,
@@ -788,6 +861,12 @@ class DemoMiner:
                 *(draft_failures or ()),
                 "required generated self-test suite was missing or malformed",
             ]
+        if draft_failures:
+            print(
+                f"[{self.log_prefix}] draft failed local self-test gate "
+                f"({len(draft_failures)} failure(s)); first: "
+                f"{draft_failures[0][:180]}"
+            )
 
         # Once a configured test suite passes, do not spend the remaining
         # deadline on an unnecessary review call.
@@ -816,6 +895,9 @@ class DemoMiner:
 
         candidate_code = draft_code
         candidate_failures = draft_failures or []
+        best_code = draft_code
+        best_raw = raw
+        best_failure_count = len(candidate_failures)
         # Without an executed failing suite this is the legacy independent
         # review. Actual test failures unlock the bounded repair loop.
         max_attempts = (
@@ -892,6 +974,13 @@ class DemoMiner:
                     *(reviewed_failures or ()),
                     "required generated self-test suite was missing or malformed",
                 ]
+            if (
+                reviewed_failures is not None
+                and len(reviewed_failures) < best_failure_count
+            ):
+                best_code = reviewed_code
+                best_raw = reviewed_raw
+                best_failure_count = len(reviewed_failures)
             if reviewed_failures == [] or (
                 reviewed_failures is None and draft_failures is None
             ):
@@ -911,19 +1000,61 @@ class DemoMiner:
             print(
                 f"[{self.log_prefix}] self-verification replacement failed "
                 f"local self-test ({len(reviewed_failures)} failure(s)); "
-                f"retry {attempt + 1}/{max_attempts}"
+                f"retry {attempt + 1}/{max_attempts}; first: "
+                f"{reviewed_failures[0][:180]}"
             )
         if draft_failures:
             print(
-                f"[{self.log_prefix}] local self-test rejected the final draft "
-                f"({len(draft_failures)} failure(s))"
+                f"[{self.log_prefix}] local self-tests did not pass before the "
+                f"repair loop ended; submitting the strongest candidate "
+                f"({best_failure_count} failure(s))"
             )
             return SolutionPayload(
                 problem_id=request.problem_id,
-                code="",
-                raw_response="<local self-test failed>\n" + raw,
+                code=best_code,
+                raw_response=best_raw,
             )
         return SolutionPayload(problem_id=request.problem_id, code=draft_code, raw_response=raw)
+
+    async def _generate_self_tests(
+        self,
+        request: TaskRequest,
+        *,
+        max_cases: int,
+        budget_s: float,
+    ) -> list[TestCase]:
+        """Recover a missing combined-response suite with a test-only call."""
+
+        if budget_s <= 0.0:
+            return []
+        try:
+            raw = await asyncio.wait_for(
+                self.client.complete(
+                    build_self_test_messages(
+                        request,
+                        max_self_test_cases=max_cases,
+                    ),
+                    timeout_s=budget_s,
+                ),
+                timeout=budget_s,
+            )
+        except Exception as exc:  # noqa: BLE001 - repair can still proceed
+            print(
+                f"[{self.log_prefix}] dedicated self-test generation failed "
+                f"({type(exc).__name__})"
+            )
+            return []
+        tests = extract_generated_tests(
+            request,
+            raw,
+            max_cases=max_cases,
+        )
+        if not tests:
+            print(
+                f"[{self.log_prefix}] dedicated self-test generation returned "
+                "no valid cases"
+            )
+        return tests
 
     async def _local_test_failures(
         self,

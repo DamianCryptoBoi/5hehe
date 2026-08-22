@@ -320,6 +320,23 @@ fn main() {}
     assert tests == [Case(args=["hello\n"], kwargs={}, expected="hello\n")]
 
 
+def test_generated_self_tests_accept_plain_json():
+    request = TaskRequest(
+        problem_id="p",
+        language="python",
+        statement="Add two integers.",
+        entrypoint="add",
+    )
+
+    tests = extract_generated_tests(
+        request,
+        '{"tests":[{"args":[2,5],"kwargs":{},"expected":7}]}',
+        max_cases=8,
+    )
+
+    assert tests == [Case(args=[2, 5], kwargs={}, expected=7)]
+
+
 async def test_passing_generated_self_tests_send_without_review(tmp_path):
     initial = """```self-tests
 {"tests":[{"args":[-2,5],"kwargs":{},"expected":3}]}
@@ -353,14 +370,10 @@ def add(a, b):
 
 async def test_missing_generated_self_tests_are_restored_before_acceptance(tmp_path):
     initial = "```python\ndef add(a, b):\n    return a + b\n```"
-    repaired = """```self-tests
+    generated = """```json
 {"tests":[{"args":[-2,5],"kwargs":{},"expected":3}]}
-```
-```python
-def add(a, b):
-    return a + b
 ```"""
-    client = SequencedGLM(initial, repaired)
+    client = SequencedGLM(initial, generated)
     miner = DemoMiner(
         demo_settings(
             miner_self_test=True,
@@ -380,8 +393,9 @@ def add(a, b):
 
     assert payload.code == "def add(a, b):\n    return a + b"
     assert len(client.calls) == 2
-    assert "omitted a valid generated self-test" in client.calls[1][0][-1]["content"]
-    assert "`self-tests` JSON block" in client.calls[1][0][0]["content"]
+    assert "independent test designer" in client.calls[1][0][0]["content"]
+    assert "Do not generate an implementation" in client.calls[1][0][0]["content"]
+    assert all(message["role"] != "assistant" for message in client.calls[1][0])
 
 
 async def test_failed_generated_self_tests_loop_until_repair_passes(tmp_path):
@@ -448,8 +462,8 @@ def add(a, b):
 
     payload = await miner.solve(request, timeout_s=30.0)
 
-    assert payload.code == ""
-    assert payload.raw_response.startswith("<local self-test failed>")
+    assert payload.code == "def add(a, b):\n    return 0"
+    assert payload.raw_response == initial
     assert len(client.calls) == 3
 
 

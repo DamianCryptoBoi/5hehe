@@ -135,7 +135,10 @@ operator-owned tests from `MINER_SELF_TEST_FILE`. A pass is returned immediately
 a failure enters a repair/retest loop bounded by
 `MINER_SELF_VERIFY_MAX_ATTEMPTS` and the signed request deadline. Tests remain
 fixed across repairs. This is local validation only and does not expose
-validator hidden tests or results.
+validator hidden tests or results. A missing combined-response suite triggers a
+bounded test-only request, and schema-valid generic `json` fences are accepted.
+If the loop exhausts its attempts or deadline, it submits the candidate with the
+fewest local failures rather than blank source.
 
 To exercise the real OpenAI-compatible provider with all five samples, including
 the signed miner endpoint, self-review, and Docker self-tests, run from the

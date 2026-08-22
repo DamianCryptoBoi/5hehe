@@ -121,7 +121,7 @@ class _FakeMetagraph:
 class _Timeline:
     def __init__(self):
         self.events: list[tuple[str, float, float]] = []
-        self.ai_outputs: list[str] = []
+        self.ai_outputs: list[tuple[str, str]] = []
         self.test_results: list[list[Any]] = []
 
     def add(self, label: str, started: float, finished: float) -> None:
@@ -151,13 +151,20 @@ class _TimedProvider:
         return self.inner.log_prefix
 
     async def complete(self, messages, *, timeout_s):
+        system_content = messages[0].get("content", "") if messages else ""
+        if "independent test designer" in system_content:
+            stage = "self-tests-ai"
+        elif any(message.get("role") == "assistant" for message in messages):
+            stage = "review-ai"
+        else:
+            stage = "draft-ai"
         started = time.perf_counter()
         try:
             output = await self.inner.complete(messages, timeout_s=timeout_s)
-            self.timeline.ai_outputs.append(output)
+            self.timeline.ai_outputs.append((stage, output))
             return output
         finally:
-            self.timeline.add("ai", started, time.perf_counter())
+            self.timeline.add(stage, started, time.perf_counter())
 
     async def aclose(self):
         await self.inner.aclose()
@@ -303,7 +310,6 @@ async def run_sample(
         for label, _started, finished in ordered_events
         if label == "signed-submit"
     )
-    ai_count = 0
     test_count = 0
     report_events: list[tuple[str, float, float]] = []
     stage_records: list[dict[str, Any]] = []
@@ -311,9 +317,8 @@ async def run_sample(
         if label == "tests" and started >= wire_finished:
             report_events.append((label, started, finished))
             continue
-        if label == "ai":
-            ai_count += 1
-            display_label = "draft-ai" if ai_count == 1 else "review-ai"
+        if label in {"draft-ai", "self-tests-ai", "review-ai"}:
+            display_label = label
         elif label == "tests":
             test_count += 1
             display_label = "draft-tests" if test_count == 1 else "review-tests"
@@ -366,17 +371,22 @@ async def run_sample(
 
     sample_artifacts = artifacts_root / run_id / name
     suffix = ".rs" if payload["language"] == "rust" else ".py"
-    draft_code = (
-        _extract_sample_code(payload["language"], timeline.ai_outputs[0])
-        if timeline.ai_outputs
-        else ""
+    draft_output = next(
+        (
+            model_output
+            for stage, model_output in timeline.ai_outputs
+            if stage == "draft-ai"
+        ),
+        "",
     )
+    draft_code = _extract_sample_code(payload["language"], draft_output)
     repair_codes = [
         _extract_sample_code(payload["language"], model_output)
-        for model_output in timeline.ai_outputs[1:]
+        for stage, model_output in timeline.ai_outputs
+        if stage == "review-ai"
     ]
     generated_tests: list[TestCase] = []
-    for model_output in timeline.ai_outputs:
+    for _stage, model_output in timeline.ai_outputs:
         generated_tests = extract_generated_tests(
             request,
             model_output,

@@ -122,7 +122,10 @@ cases. A pass is returned immediately; a failure is sent back with test evidence
 for repair and retested, up to `MINER_SELF_VERIFY_MAX_ATTEMPTS` times while the
 request deadline permits. The tests stay fixed across repairs. Without an
 executed failing suite, self-verification retains its single independent review
-behavior.
+behavior. If the combined response omits the suite, a bounded test-only provider
+call recovers it. Both `self-tests` and schema-valid `json` fences are accepted.
+If no repair passes before the limit, the strongest well-formed candidate is
+submitted instead of an empty guaranteed-zero answer.
 
 ## Local self-tests
 
@@ -137,8 +140,9 @@ The operator file is JSONL:
 Generated cases are preflight heuristics, not validator hidden tests. The
 default executor is Docker with no network and bounded resources. The
 `subprocess` executor is available for local development only; it is not a full
-Linux security boundary. A failed local test rejects the candidate, while an
-unavailable self-test sandbox is logged and treated as inconclusive.
+Linux security boundary. A failed local test triggers repair; exhausted repairs
+fall back to the candidate with the fewest failures. An unavailable self-test
+sandbox is logged and treated as inconclusive.
 
 ## Task archive
 
