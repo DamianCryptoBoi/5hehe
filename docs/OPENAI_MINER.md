@@ -122,6 +122,34 @@ curl http://127.0.0.1:8091/health
 
 The response names the configured model but never exposes the API key.
 
+The miner also archives each authenticated, authorized, schema-valid public task
+to `MINER_TASK_ARCHIVE_FILE` (default `data/miner_tasks.jsonl`) before model
+inference. Records are JSONL and include a semantic task fingerprint plus
+non-secret receipt metadata. Hidden tests are not sent to miners, so this archive
+contains only the public task and cannot recover the private evaluation suite.
+
+Set `MINER_SELF_TEST=true` to run public examples and operator-owned tests from
+`MINER_SELF_TEST_FILE` before returning a solution. Tests are selected by the
+semantic task fingerprint written by the task archive and run in the configured
+Docker sandbox. This is local validation only; it does not provide validator
+hidden tests or their results to the miner.
+
+To exercise the real OpenAI-compatible provider with all five samples, including
+the signed miner endpoint, self-review, and Docker self-tests, run from the
+repository root:
+
+```bash
+PYTHONPATH=. .venv/bin/python scripts/smoke_miner_samples.py --provider openai
+```
+
+The command places only the first case in each model prompt and loads the
+remaining sample cases as operator-owned local tests. It logs provider-call
+times, local-test times, signed-response latency, and per-case results. Use
+`--example NAME` to run a subset. It exits nonzero when a returned solution
+fails any case. Structured results are appended to
+`data/miner_sample_smoke.jsonl`; generated draft, review, and submitted source
+files are retained under `data/miner_sample_smoke_artifacts/<run-id>/`.
+
 ## Solver prompt
 
 Python and Rust use separate, compact system prompts that mirror their actual
@@ -168,6 +196,11 @@ MINER_REQUIRE_VALIDATOR_PERMIT=true
 MINER_MIN_STAKE=0
 MINER_MAX_CONCURRENT_REQUESTS=4
 MINER_MAX_REQUEST_BYTES=1000000
+MINER_TASK_ARCHIVE_FILE=data/miner_tasks.jsonl
+MINER_SELF_TEST=false
+MINER_SELF_TEST_FILE=data/miner_tests.jsonl
+MINER_SELF_TEST_EXECUTOR=docker
+MINER_SELF_TEST_TIMEOUT_S=5
 MINER_METAGRAPH_SYNC_S=300
 ```
 

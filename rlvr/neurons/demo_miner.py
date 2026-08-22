@@ -7,11 +7,14 @@ solution, and signs the exact response bytes with the miner hotkey.
 
 import ast
 import asyncio
+import hashlib
 import json
+import os
 import re
+import threading
 import time
 from contextlib import asynccontextmanager
-from typing import Any, Mapping, Optional
+from typing import Any, Literal, Mapping, Optional
 
 import httpx
 from pydantic import Field
@@ -24,6 +27,7 @@ from ..protocol import (
     sign_message,
     verify_signature,
 )
+from ..types import ExecutionResult, TestCase
 
 PYTHON_SYSTEM_PROMPT = (
     "You are an expert competitive-programming solver. Produce a correct and "
@@ -130,9 +134,46 @@ class DemoMinerSettings(BaseSettings):
     axon_external_ip: str = ""
     miner_max_concurrent_requests: int = Field(default=4, ge=1, le=256)
     miner_max_request_bytes: int = Field(default=1_000_000, ge=1, le=10_000_000)
+    # Append validated public tasks for offline benchmark construction. The
+    # archive contains no hidden tests; set an empty value to disable capture.
+    miner_task_archive_file: str = "data/miner_tasks.jsonl"
+    # Optional local preflight. Docker is the safe default; subprocess is
+    # available only for local development and is not a Linux security boundary.
+    miner_self_test: bool = False
+    miner_self_test_file: str = "data/miner_tests.jsonl"
+    miner_self_test_executor: Literal["docker", "subprocess"] = "docker"
+    miner_self_test_timeout_s: float = Field(default=5.0, gt=0.0, le=300.0)
+    miner_self_test_docker_image: str = "python:3.12-slim"
+    miner_self_test_docker_memory: str = "256m"
+    miner_self_test_docker_cpus: float = Field(default=1.0, gt=0.0, le=256.0)
+    miner_self_test_docker_pids_limit: int = Field(default=128, ge=16, le=4096)
     miner_metagraph_sync_s: float = Field(default=300.0, gt=0.0)
     miner_min_stake: float = Field(default=0.0, ge=0.0)
     miner_require_validator_permit: bool = True
+
+
+def semantic_task_fingerprint(request: TaskRequest) -> str:
+    """Fingerprint the public task while ignoring per-request identifiers."""
+
+    task = request.model_dump(mode="json")
+    fingerprint_input = {
+        key: task[key]
+        for key in (
+            "language",
+            "statement",
+            "entrypoint",
+            "public_examples",
+            "prompt_variant",
+        )
+        if key in task
+    }
+    canonical = json.dumps(
+        fingerprint_input,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
 
 
 def extract_python(text: str) -> str:
@@ -140,6 +181,139 @@ def extract_python(text: str) -> str:
 
     match = _PYTHON_FENCE_RE.search(text) or _ANY_FENCE_RE.search(text)
     return (match.group(1) if match else text).strip()
+
+
+class TaskArchive:
+    """Append validated public tasks as JSONL without affecting inference."""
+
+    def __init__(self, path: str) -> None:
+        self.path = str(path or "").strip()
+        self._lock = threading.Lock()
+
+    def append(self, request: TaskRequest, headers: Mapping[str, str]) -> None:
+        if not self.path:
+            return
+        task = request.model_dump(mode="json")
+        # The request body is the benchmark input. Receipt fields make repeated
+        # observations traceable without retaining signatures or API headers.
+        record = {
+            "schema_version": 1,
+            "captured_at": time.time(),
+            "task_fingerprint": semantic_task_fingerprint(request),
+            "request": task,
+            "receipt": {
+                "signed_by": headers.get("Epistula-Signed-By", ""),
+                "request_nonce": headers.get("Epistula-Uuid", ""),
+                "signed_at_ms": headers.get("Epistula-Timestamp", ""),
+            },
+        }
+        encoded = (json.dumps(record, ensure_ascii=False, separators=(",", ":")) + "\n").encode(
+            "utf-8"
+        )
+        try:
+            with self._lock:
+                parent = os.path.dirname(self.path)
+                if parent:
+                    os.makedirs(parent, exist_ok=True)
+                with open(self.path, "ab+") as handle:
+                    handle.seek(0, os.SEEK_END)
+                    if handle.tell():
+                        handle.seek(-1, os.SEEK_END)
+                        if handle.read(1) != b"\n":
+                            handle.seek(0, os.SEEK_END)
+                            handle.write(b"\n")
+                    handle.seek(0, os.SEEK_END)
+                    handle.write(encoded)
+        except OSError as exc:
+            # Capturing is observability. A full or unavailable disk must not
+            # turn an otherwise valid miner request into a failed solve.
+            print(f"[demo-miner] task archive write failed ({type(exc).__name__})")
+
+
+class LocalTestCorpus:
+    """Load operator-owned test cases keyed by semantic task fingerprint."""
+
+    def __init__(self, path: str) -> None:
+        self.path = str(path or "").strip()
+        self._tests: dict[str, list[TestCase]] = {}
+        if not self.path:
+            return
+        try:
+            with open(self.path, "r", encoding="utf-8") as handle:
+                for line_number, line in enumerate(handle, 1):
+                    if not line.strip():
+                        continue
+                    try:
+                        record = json.loads(line)
+                        fingerprint = str(record["task_fingerprint"])
+                        raw_tests = record.get("tests", [])
+                        if not isinstance(raw_tests, list):
+                            raise ValueError("tests must be a list")
+                        tests = [TestCase.model_validate(item) for item in raw_tests]
+                    except Exception as exc:  # noqa: BLE001 - one bad record is isolated
+                        print(
+                            f"[demo-miner] ignoring local test record "
+                            f"{self.path}:{line_number} ({type(exc).__name__})"
+                        )
+                        continue
+                    self._tests.setdefault(fingerprint, []).extend(tests)
+        except FileNotFoundError:
+            return
+        except OSError as exc:
+            print(f"[demo-miner] local test corpus unavailable ({type(exc).__name__})")
+
+    def for_request(self, request: TaskRequest) -> list[TestCase]:
+        return list(self._tests.get(semantic_task_fingerprint(request), ()))
+
+
+class LocalSelfTester:
+    """Run public and operator-owned tests through the repository executor."""
+
+    def __init__(self, settings: Any) -> None:
+        self.settings = settings
+        self.corpus = LocalTestCorpus(
+            getattr(settings, "miner_self_test_file", "data/miner_tests.jsonl")
+        )
+        self._executors: dict[str, Any] = {}
+
+    def _get_executor(self, language: str):
+        if language in self._executors:
+            return self._executors[language]
+        from types import SimpleNamespace
+
+        from ..execution.executor import get_executor
+
+        execution_settings = SimpleNamespace(
+            executor=getattr(self.settings, "miner_self_test_executor", "docker"),
+            docker_image=getattr(
+                self.settings, "miner_self_test_docker_image", "python:3.12-slim"
+            ),
+            docker_memory=getattr(
+                self.settings, "miner_self_test_docker_memory", "256m"
+            ),
+            docker_cpus=getattr(self.settings, "miner_self_test_docker_cpus", 1.0),
+            docker_pids_limit=getattr(
+                self.settings, "miner_self_test_docker_pids_limit", 128
+            ),
+        )
+        executor = get_executor(execution_settings, language=language)
+        self._executors[language] = executor
+        return executor
+
+    def cases_for(self, request: TaskRequest) -> list[TestCase]:
+        return [*request.public_examples, *self.corpus.for_request(request)]
+
+    def run(self, request: TaskRequest, code: str) -> list[ExecutionResult]:
+        tests = self.cases_for(request)
+        if not tests:
+            return []
+        executor = self._get_executor(request.language)
+        return executor.run_tests(
+            code,
+            request.entrypoint,
+            tests,
+            float(getattr(self.settings, "miner_self_test_timeout_s", 5.0)),
+        )
 
 
 def extract_rust(text: str) -> str:
@@ -186,18 +360,27 @@ def build_model_messages(request: TaskRequest) -> list[dict[str, str]]:
 
 
 def build_verification_messages(
-    request: TaskRequest, candidate_code: str
+    request: TaskRequest,
+    candidate_code: str,
+    local_test_feedback: Optional[list[str]] = None,
 ) -> list[dict[str, str]]:
     """Ask for a fresh audit while retaining the exact public task context."""
 
     language = "rust" if request.language == "rust" else "python"
+    review_prompt = SELF_VERIFICATION_PROMPT
+    if local_test_feedback:
+        review_prompt += (
+            "\n\nThe miner's local preflight found these failures. Treat them as "
+            "debugging evidence and repair the candidate before returning it:\n- "
+            + "\n- ".join(local_test_feedback)
+        )
     return [
         *build_model_messages(request),
         {
             "role": "assistant",
             "content": f"```{language}\n{candidate_code.strip()}\n```",
         },
-        {"role": "user", "content": SELF_VERIFICATION_PROMPT},
+        {"role": "user", "content": review_prompt},
     ]
 
 
@@ -358,6 +541,14 @@ class DemoMiner:
         self.metagraph = metagraph
         self.nonces = NonceCache(window_ms=8000)
         self.solve_slots = asyncio.Semaphore(settings.miner_max_concurrent_requests)
+        self.task_archive = TaskArchive(
+            getattr(settings, "miner_task_archive_file", "data/miner_tasks.jsonl")
+        )
+        self.self_tester = (
+            LocalSelfTester(settings)
+            if bool(getattr(settings, "miner_self_test", False))
+            else None
+        )
 
     @property
     def model_name(self) -> str:
@@ -435,7 +626,29 @@ class DemoMiner:
                 raw_response="<model request failed>",
             )
         draft_code = _extract_code(request, raw)
-        if not self_verify or not draft_code:
+        if not draft_code:
+            return SolutionPayload(
+                problem_id=request.problem_id,
+                code=draft_code,
+                raw_response=raw,
+            )
+
+        draft_failures = await self._local_test_failures(
+            request,
+            draft_code,
+            budget_s=max(0.001, deadline - time.monotonic()),
+        )
+        if not self_verify:
+            if draft_failures:
+                print(
+                    f"[{self.log_prefix}] local self-test rejected the draft "
+                    f"({len(draft_failures)} failure(s))"
+                )
+                return SolutionPayload(
+                    problem_id=request.problem_id,
+                    code="",
+                    raw_response="<local self-test failed>\n" + raw,
+                )
             return SolutionPayload(
                 problem_id=request.problem_id,
                 code=draft_code,
@@ -451,32 +664,83 @@ class DemoMiner:
             try:
                 reviewed_raw = await asyncio.wait_for(
                     self.client.complete(
-                        build_verification_messages(request, draft_code),
+                        build_verification_messages(
+                            request,
+                            draft_code,
+                            local_test_feedback=draft_failures,
+                        ),
                         timeout_s=review_timeout_s,
                     ),
                     timeout=review_timeout_s,
                 )
                 reviewed_code = _extract_code(request, reviewed_raw)
                 if _is_well_formed_replacement(request, reviewed_code):
-                    return SolutionPayload(
-                        problem_id=request.problem_id,
-                        code=reviewed_code,
-                        raw_response=reviewed_raw,
+                    reviewed_failures = await self._local_test_failures(
+                        request,
+                        reviewed_code,
+                        budget_s=max(0.001, deadline - time.monotonic()),
                     )
-                print(
-                    f"[{self.log_prefix}] self-verification returned invalid "
-                    "source; using initial draft"
-                )
+                    if not reviewed_failures:
+                        return SolutionPayload(
+                            problem_id=request.problem_id,
+                            code=reviewed_code,
+                            raw_response=reviewed_raw,
+                        )
+                    print(
+                        f"[{self.log_prefix}] self-verification replacement failed "
+                        f"local self-test ({len(reviewed_failures)} failure(s))"
+                    )
+                else:
+                    print(
+                        f"[{self.log_prefix}] self-verification returned invalid "
+                        "source; using initial draft"
+                    )
             except Exception as exc:  # noqa: BLE001 - retain the usable draft
                 print(
                     f"[{self.log_prefix}] self-verification failed; using "
                     f"initial draft ({type(exc).__name__})"
                 )
-        return SolutionPayload(
-            problem_id=request.problem_id,
-            code=draft_code,
-            raw_response=raw,
-        )
+        if draft_failures:
+            print(
+                f"[{self.log_prefix}] local self-test rejected the final draft "
+                f"({len(draft_failures)} failure(s))"
+            )
+            return SolutionPayload(
+                problem_id=request.problem_id,
+                code="",
+                raw_response="<local self-test failed>\n" + raw,
+            )
+        return SolutionPayload(problem_id=request.problem_id, code=draft_code, raw_response=raw)
+
+    async def _local_test_failures(
+        self, request: TaskRequest, code: str, *, budget_s: Optional[float] = None
+    ) -> list[str]:
+        """Run configured local tests off the event loop and summarize failures."""
+
+        if self.self_tester is None:
+            return []
+        try:
+            run = asyncio.to_thread(self.self_tester.run, request, code)
+            if budget_s is None:
+                results = await run
+            else:
+                results = await asyncio.wait_for(run, timeout=max(0.001, budget_s))
+        except asyncio.TimeoutError:
+            print(f"[{self.log_prefix}] local self-test exceeded its remaining budget")
+            return []
+        except Exception as exc:  # noqa: BLE001 - unavailable self-test is fail-open
+            print(
+                f"[{self.log_prefix}] local self-test unavailable; preserving candidate "
+                f"({type(exc).__name__})"
+            )
+            return []
+        failures: list[str] = []
+        for result in results:
+            if result.passed:
+                continue
+            detail = result.error or result.actual_repr or "failed"
+            failures.append(f"test {result.test_index}: {detail[:300]}")
+        return failures
 
     async def handle_request(
         self, headers: Mapping[str, str], body: bytes
@@ -500,6 +764,10 @@ class DemoMiner:
             request = TaskRequest.model_validate_json(body)
         except Exception:  # noqa: BLE001
             return 400, {"error": "invalid task request"}
+
+        # Capture only after authentication, replay protection, authorization,
+        # and schema validation. Hidden tests are never present in this request.
+        self.task_archive.append(request, headers)
 
         provider_timeout_s = float(
             getattr(self.client, "request_timeout_s", request.deadline_s)
@@ -607,37 +875,6 @@ def build_demo_miner_app(miner: DemoMiner):
             )
         return response
 
-    @app.get("/solve")
-    async def solve_endpoint(request: Request) -> Response:
-        await maybe_sync_metagraph()
-        body = await read_bounded(request)
-        if body is None:
-            return Response(
-                content=b'{"error":"request body too large"}',
-                status_code=413,
-                media_type="application/json",
-            )
-
-        status, payload = await miner.handle_request(request.headers, body)
-        if isinstance(payload, SolutionPayload):
-            response_body = payload.model_dump_json().encode("utf-8")
-        else:
-            response_body = json.dumps(payload, separators=(",", ":")).encode("utf-8")
-        response = Response(
-            content=response_body,
-            status_code=status,
-            media_type="application/json",
-        )
-        if status == 200 and miner.wallet is not None:
-            response.headers.update(
-                sign_message(
-                    miner.wallet,
-                    response_body,
-                    signed_for=request.headers.get("Epistula-Signed-By", ""),
-                )
-            )
-        return response
-    
     @app.get("/health")
     async def health() -> dict[str, str]:
         return {"status": "ok", "model": miner.model_name}

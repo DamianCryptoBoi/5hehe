@@ -85,6 +85,11 @@ MINER_REQUIRE_VALIDATOR_PERMIT=true
 MINER_MIN_STAKE=0
 MINER_MAX_CONCURRENT_REQUESTS=4
 MINER_MAX_REQUEST_BYTES=1000000
+MINER_TASK_ARCHIVE_FILE=data/miner_tasks.jsonl
+MINER_SELF_TEST=false
+MINER_SELF_TEST_FILE=data/miner_tests.jsonl
+MINER_SELF_TEST_EXECUTOR=docker
+MINER_SELF_TEST_TIMEOUT_S=5
 MINER_METAGRAPH_SYNC_S=300
 ```
 
@@ -115,3 +120,48 @@ the validator deadline. If review fails or returns malformed source, the miner
 keeps the first draft. Review is stopped slightly early to leave wire time for
 that fallback draft. Disable it only when one-pass latency and provider cost
 matter more than the additional accuracy check.
+
+## Local self-tests
+
+Set `MINER_SELF_TEST=true` to run the candidate against public examples and any
+operator-owned cases matching its task fingerprint in `MINER_SELF_TEST_FILE`.
+The file is JSONL:
+
+```json
+{"task_fingerprint":"<sha256>","tests":[{"args":[2,3],"kwargs":{},"expected":5}]}
+```
+
+The default executor is Docker with no network and bounded resources. The
+`subprocess` executor is available for local development only; it is not a full
+Linux security boundary. A failed local test rejects the candidate, while an
+unavailable self-test sandbox is logged and treated as inconclusive.
+
+## Task archive
+
+After authentication, replay protection, authorization, and schema validation,
+the miner appends each received public task to `MINER_TASK_ARCHIVE_FILE` as
+newline-delimited JSON. The default is `data/miner_tasks.jsonl`. Records include
+the statement, language, entrypoint, public examples, prompt variant, a semantic
+task fingerprint, and non-secret receipt metadata. Hidden tests are never sent
+to the miner and cannot appear in this archive.
+
+The archive is observability only: a write failure is logged and does not fail a
+valid model request. Repeated requests can be deduplicated by
+`task_fingerprint`, while each receipt remains available for provenance.
+
+## Real-provider sample smoke test
+
+From the repository root, run all five sample challenges through the real GLM
+provider, signed miner endpoint, self-review, and Docker self-test flow:
+
+```bash
+PYTHONPATH=. .venv/bin/python scripts/smoke_miner_samples.py --provider glm
+```
+
+The command sends only the first sample case in each model request and keeps the
+remaining sample cases as local operator tests. Each sample logs provider-call
+times, local-test times, signed-response latency, and per-case results. Use
+`--example NAME` to run a subset. The command exits nonzero if any returned
+solution fails its sample cases. Structured results are appended to
+`data/miner_sample_smoke.jsonl`; generated draft, review, and submitted source
+files are retained under `data/miner_sample_smoke_artifacts/<run-id>/`.

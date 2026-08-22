@@ -76,6 +76,15 @@ class OpenAICompatibleSettings(BaseSettings):
     axon_external_ip: str = ""
     miner_max_concurrent_requests: int = Field(default=4, ge=1, le=256)
     miner_max_request_bytes: int = Field(default=1_000_000, ge=1, le=10_000_000)
+    miner_task_archive_file: str = "data/miner_tasks.jsonl"
+    miner_self_test: bool = False
+    miner_self_test_file: str = "data/miner_tests.jsonl"
+    miner_self_test_executor: Literal["docker", "subprocess"] = "docker"
+    miner_self_test_timeout_s: float = Field(default=5.0, gt=0.0, le=300.0)
+    miner_self_test_docker_image: str = "python:3.12-slim"
+    miner_self_test_docker_memory: str = "256m"
+    miner_self_test_docker_cpus: float = Field(default=1.0, gt=0.0, le=256.0)
+    miner_self_test_docker_pids_limit: int = Field(default=128, ge=16, le=4096)
     miner_metagraph_sync_s: float = Field(default=300.0, gt=0.0)
     miner_min_stake: float = Field(default=0.0, ge=0.0)
     miner_require_validator_permit: bool = True

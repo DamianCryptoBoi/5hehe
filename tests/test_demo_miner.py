@@ -13,10 +13,13 @@ from rlvr.neurons.demo_miner import (
     DemoMiner,
     DemoMinerSettings,
     GLM52Client,
+    LocalTestCorpus,
+    TaskArchive,
     build_demo_miner_app,
     build_model_messages,
     build_verification_messages,
     extract_python,
+    semantic_task_fingerprint,
 )
 from rlvr.neurons.live import LiveSolverClient
 from rlvr.protocol import TaskRequest
@@ -110,6 +113,174 @@ def test_extract_python_prefers_python_fence():
     reply = "Text\n```json\n{}\n```\n```python\ndef f():\n    return 1\n```"
     assert extract_python(reply) == "def f():\n    return 1"
     assert extract_python("def f():\n    return 1") == "def f():\n    return 1"
+
+
+def test_task_archive_writes_public_task_and_semantic_fingerprint(tmp_path):
+    path = tmp_path / "tasks.jsonl"
+    archive = TaskArchive(str(path))
+    request = TaskRequest(
+        problem_id="per-request-id",
+        language="python",
+        statement="Add two integers.",
+        entrypoint="add",
+        public_examples=[Case(args=[1, 2], expected=3)],
+        prompt_variant=7,
+    )
+
+    archive.append(
+        request,
+        {
+            "Epistula-Signed-By": "validator-hotkey",
+            "Epistula-Uuid": "nonce-1",
+            "Epistula-Timestamp": "123",
+            "Epistula-Signature": "must-not-be-stored",
+        },
+    )
+
+    record = json.loads(path.read_text(encoding="utf-8"))
+    assert record["schema_version"] == 1
+    assert record["request"] == request.model_dump(mode="json")
+    assert len(record["task_fingerprint"]) == 64
+    assert record["receipt"] == {
+        "signed_by": "validator-hotkey",
+        "request_nonce": "nonce-1",
+        "signed_at_ms": "123",
+    }
+    assert "must-not-be-stored" not in path.read_text(encoding="utf-8")
+
+
+def test_task_archive_fingerprint_ignores_per_request_problem_id(tmp_path):
+    path = tmp_path / "tasks.jsonl"
+    archive = TaskArchive(str(path))
+    common = {
+        "language": "python",
+        "statement": "Return one.",
+        "entrypoint": "f",
+        "public_examples": [],
+        "prompt_variant": 0,
+    }
+    archive.append(TaskRequest(problem_id="request-a", **common), {})
+    archive.append(TaskRequest(problem_id="request-b", **common), {})
+
+    records = [json.loads(line) for line in path.read_text().splitlines()]
+    assert len(records) == 2
+    assert records[0]["task_fingerprint"] == records[1]["task_fingerprint"]
+
+
+def test_task_archive_can_be_disabled(tmp_path):
+    archive = TaskArchive("")
+    archive.append(
+        TaskRequest(
+            problem_id="p",
+            language="python",
+            statement="Return one.",
+            entrypoint="f",
+        ),
+        {},
+    )
+    assert list(tmp_path.iterdir()) == []
+
+
+def test_local_test_corpus_loads_cases_by_task_fingerprint(tmp_path):
+    request = TaskRequest(
+        problem_id="request-id",
+        language="python",
+        statement="Add two integers.",
+        entrypoint="add",
+    )
+    path = tmp_path / "tests.jsonl"
+    path.write_text(
+        json.dumps(
+            {
+                "task_fingerprint": semantic_task_fingerprint(request),
+                "tests": [{"args": [20, 22], "kwargs": {}, "expected": 42}],
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    corpus = LocalTestCorpus(str(path))
+
+    assert corpus.for_request(request) == [
+        Case(args=[20, 22], kwargs={}, expected=42)
+    ]
+
+
+async def test_local_self_test_rejects_wrong_code_with_subprocess(tmp_path):
+    client = FakeGLM("```python\ndef add(a, b):\n    return a - b\n```")
+    miner = DemoMiner(
+        demo_settings(
+            miner_self_test=True,
+            miner_self_test_executor="subprocess",
+            miner_self_test_file=str(tmp_path / "missing.jsonl"),
+            miner_self_verify=False,
+        ),
+        client,
+    )
+    request = TaskRequest(
+        problem_id="p",
+        language="python",
+        statement="Return the sum.",
+        entrypoint="add",
+        public_examples=[Case(args=[2, 3], expected=5)],
+    )
+
+    payload = await miner.solve(request, timeout_s=30.0)
+
+    assert payload.code == ""
+    assert payload.raw_response.startswith("<local self-test failed>")
+
+
+async def test_local_self_test_accepts_code_that_passes_public_examples(tmp_path):
+    client = FakeGLM("```python\ndef add(a, b):\n    return a + b\n```")
+    miner = DemoMiner(
+        demo_settings(
+            miner_self_test=True,
+            miner_self_test_executor="subprocess",
+            miner_self_test_file=str(tmp_path / "missing.jsonl"),
+            miner_self_verify=False,
+        ),
+        client,
+    )
+    request = TaskRequest(
+        problem_id="p",
+        language="python",
+        statement="Return the sum.",
+        entrypoint="add",
+        public_examples=[Case(args=[2, 3], expected=5)],
+    )
+
+    payload = await miner.solve(request, timeout_s=30.0)
+
+    assert payload.code == "def add(a, b):\n    return a + b"
+
+
+async def test_local_self_test_allows_review_repair(tmp_path):
+    draft = "```python\ndef add(a, b):\n    return a - b\n```"
+    corrected = "```python\ndef add(a, b):\n    return a + b\n```"
+    client = SequencedGLM(draft, corrected)
+    miner = DemoMiner(
+        demo_settings(
+            miner_self_test=True,
+            miner_self_test_executor="subprocess",
+            miner_self_test_file=str(tmp_path / "missing.jsonl"),
+        ),
+        client,
+    )
+    request = TaskRequest(
+        problem_id="p",
+        language="python",
+        statement="Return the sum.",
+        entrypoint="add",
+        public_examples=[Case(args=[2, 3], expected=5)],
+    )
+
+    payload = await miner.solve(request, timeout_s=30.0)
+
+    assert payload.code == "def add(a, b):\n    return a + b"
+    assert payload.raw_response == corrected
+    assert "test 0" in client.calls[1][0][-1]["content"]
 
 
 def test_model_prompt_contains_only_public_task_data():
