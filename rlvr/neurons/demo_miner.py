@@ -8,12 +8,14 @@ solution, and signs the exact response bytes with the miner hotkey.
 import ast
 import asyncio
 import hashlib
+import inspect
 import json
 import os
 import re
 import threading
 import time
 from contextlib import asynccontextmanager
+from datetime import datetime, timezone
 from typing import Any, Mapping, Optional
 
 import httpx
@@ -143,6 +145,21 @@ _PYTHON_FENCE_RE = re.compile(
 _RUST_FENCE_RE = re.compile(r"```rust\s*\n(.*?)```", re.IGNORECASE | re.DOTALL)
 _ANY_FENCE_RE = re.compile(r"```[^\n`]*\n(.*?)```", re.DOTALL)
 _REVIEW_RESPONSE_MARGIN_S = 0.5
+
+
+def _log_value(value: object, *, limit: int = 512) -> str:
+    """Render exception/provider text safely on one single log line."""
+
+    text = str(value).replace("\r", "\\r").replace("\n", "\\n").strip()
+    if not text:
+        return "<empty>"
+    return text if len(text) <= limit else text[:limit] + "..."
+
+
+def _deadline_timestamp(epoch_s: float) -> str:
+    return datetime.fromtimestamp(epoch_s, tz=timezone.utc).isoformat(
+        timespec="milliseconds"
+    ).replace("+00:00", "Z")
 
 
 class DemoMinerSettings(BaseSettings):
@@ -404,6 +421,8 @@ class GLM52Client:
         messages: list[dict[str, str]],
         *,
         timeout_s: float,
+        request_label: str = "",
+        deadline_at: str = "",
     ) -> str:
         if not self.settings.glm_api_key:
             raise RuntimeError("GLM_API_KEY is not configured")
@@ -424,10 +443,19 @@ class GLM52Client:
         deadline = time.monotonic() + min(
             timeout_s, self.settings.glm_request_timeout_s
         )
+        deadline_at = deadline_at or _deadline_timestamp(
+            time.time() + min(timeout_s, self.settings.glm_request_timeout_s)
+        )
         for attempt in range(self.settings.glm_max_retries + 1):
             remaining = deadline - time.monotonic()
             if remaining <= 0:
+                print(
+                    f"[demo-miner] provider deadline exceeded provider=primary"
+                    f" model={_log_value(self.settings.glm_model)} attempt={attempt + 1}"
+                    f" deadline_at={deadline_at} request={_log_value(request_label)}"
+                )
                 raise TimeoutError("GLM request deadline exceeded")
+            attempt_started = time.monotonic()
             try:
                 response = await self._http.post(
                     self.completion_url,
@@ -440,21 +468,74 @@ class GLM52Client:
                     timeout=remaining,
                 )
                 if response.status_code == 429 or response.status_code >= 500:
+                    retrying = attempt < self.settings.glm_max_retries
+                    try:
+                        response_body = _log_value(response.text)
+                    except Exception:  # pragma: no cover - defensive logging only
+                        response_body = "<unavailable>"
+                    print(
+                        f"[demo-miner] provider HTTP failure provider=primary"
+                        f" model={_log_value(self.settings.glm_model)}"
+                        f" status={response.status_code} (HTTP {response.status_code})"
+                        f" attempt={attempt + 1}/{self.settings.glm_max_retries + 1}"
+                        f" retrying={str(retrying).lower()} body={response_body}"
+                        f" deadline_at={deadline_at} request={_log_value(request_label)}"
+                    )
                     if attempt < self.settings.glm_max_retries:
                         await asyncio.sleep(min(2.0**attempt, max(0.0, remaining)))
                         continue
+                elif response.status_code >= 400:
+                    try:
+                        response_body = _log_value(response.text)
+                    except Exception:  # pragma: no cover - defensive logging only
+                        response_body = "<unavailable>"
+                    print(
+                        f"[demo-miner] provider HTTP failure provider=primary"
+                        f" model={_log_value(self.settings.glm_model)}"
+                        f" status={response.status_code} (HTTP {response.status_code})"
+                        f" attempt={attempt + 1}/{self.settings.glm_max_retries + 1}"
+                        f" retrying=false body={response_body} deadline_at={deadline_at}"
+                        f" request={_log_value(request_label)}"
+                    )
                 response.raise_for_status()
                 data = response.json()
                 content = data["choices"][0]["message"]["content"]
                 if not isinstance(content, str) or not content.strip():
+                    print(
+                        f"[demo-miner] provider invalid response provider=primary"
+                        f" model={_log_value(self.settings.glm_model)} reason=empty_completion"
+                        f" attempt={attempt + 1} deadline_at={deadline_at}"
+                        f" request={_log_value(request_label)}"
+                    )
                     raise ValueError("GLM returned an empty completion")
+                print(
+                    f"[demo-miner] provider success provider=primary"
+                    f" model={_log_value(self.settings.glm_model)} attempt={attempt + 1}"
+                    f" elapsed_s={time.monotonic() - attempt_started:.3f}"
+                    f" remaining_s={max(0.0, deadline - time.monotonic()):.3f}"
+                    f" deadline_at={deadline_at} request={_log_value(request_label)}"
+                )
                 return content
-            except (httpx.TimeoutException, httpx.TransportError):
+            except (httpx.TimeoutException, httpx.TransportError) as exc:
+                retrying = attempt < self.settings.glm_max_retries
+                print(
+                    f"[demo-miner] provider transport failure provider=primary"
+                    f" model={_log_value(self.settings.glm_model)} error={type(exc).__name__}:"
+                    f" {_log_value(exc)} attempt={attempt + 1}/{self.settings.glm_max_retries + 1}"
+                    f" retrying={str(retrying).lower()} deadline_at={deadline_at}"
+                    f" request={_log_value(request_label)}"
+                )
                 if attempt >= self.settings.glm_max_retries:
                     raise
                 remaining = deadline - time.monotonic()
                 await asyncio.sleep(min(2.0**attempt, max(0.0, remaining)))
             except (KeyError, IndexError, TypeError, ValueError) as exc:
+                print(
+                    f"[demo-miner] provider response parse failure provider=primary"
+                    f" model={_log_value(self.settings.glm_model)} error={type(exc).__name__}:"
+                    f" {_log_value(exc)} attempt={attempt + 1} deadline_at={deadline_at}"
+                    f" request={_log_value(request_label)}"
+                )
                 raise RuntimeError("GLM returned an invalid response") from exc
 
         raise RuntimeError("GLM request failed")
@@ -530,25 +611,101 @@ class DemoMiner:
                 return False
         return True
 
-    async def solve(self, request: TaskRequest, timeout_s: float) -> SolutionPayload:
+    async def _complete_with_context(
+        self,
+        messages: list[dict[str, str]],
+        *,
+        timeout_s: float,
+        request_label: str,
+        deadline_at: str = "",
+    ) -> str:
+        """Call provider clients with request context when they support it.
+
+        Small test/demonstration clients historically implement only
+        ``complete(messages, timeout_s=...)``. Keep those clients compatible
+        while allowing production clients to correlate provider logs with the
+        signed request.
+        """
+
+        complete = self.client.complete
+        supports_label = False
+        supports_deadline = False
+        try:
+            parameters = inspect.signature(complete).parameters
+            supports_label = "request_label" in parameters
+            supports_deadline = "deadline_at" in parameters
+        except (TypeError, ValueError):
+            supports_label = False
+        kwargs: dict[str, Any] = {"timeout_s": timeout_s}
+        if supports_label:
+            kwargs["request_label"] = request_label
+        if supports_deadline:
+            kwargs["deadline_at"] = deadline_at
+        return await complete(messages, **kwargs)
+
+    async def solve(
+        self,
+        request: TaskRequest,
+        timeout_s: float,
+        *,
+        deadline_mono: Optional[float] = None,
+        deadline_at: Optional[float] = None,
+    ) -> SolutionPayload:
         """Generate, independently review, and return the strongest valid draft."""
 
-        deadline = time.monotonic() + timeout_s
+        started_at = time.monotonic()
+        deadline = deadline_mono if deadline_mono is not None else started_at + timeout_s
+        deadline_at = deadline_at if deadline_at is not None else time.time() + timeout_s
+        request_label = request.problem_id
+        print(
+            f"[{self.log_prefix}] solve started problem_id={_log_value(request_label)}"
+            f" timeout_s={timeout_s:.3f} deadline_at={_deadline_timestamp(deadline_at)}"
+            f" model={_log_value(self.model_name)}"
+        )
+        # Direct callers historically receive the exact timeout budget. The
+        # request path passes an absolute monotonic deadline so queued work
+        # consumes only the remaining budget.
+        available_s = (
+            max(0.0, deadline - time.monotonic())
+            if deadline_mono is not None
+            else timeout_s
+        )
         self_verify = bool(getattr(self.settings, "miner_self_verify", True))
         reserve_s = min(
             float(getattr(self.settings, "miner_self_verify_reserve_s", 90.0)),
-            timeout_s / 2.0,
+            available_s / 2.0,
         )
-        draft_timeout_s = timeout_s - reserve_s if self_verify else timeout_s
+        draft_timeout_s = available_s - reserve_s if self_verify else available_s
+        if draft_timeout_s <= 0.0:
+            print(
+                f"[{self.log_prefix}] solve deadline exceeded before provider call"
+                f" problem_id={_log_value(request_label)}"
+                f" deadline_at={_deadline_timestamp(deadline_at)}"
+            )
+            return SolutionPayload(
+                problem_id=request.problem_id,
+                code="",
+                raw_response="<model request failed>",
+            )
         try:
-            raw = await self.client.complete(
+            raw = await self._complete_with_context(
                 build_model_messages(request),
                 timeout_s=draft_timeout_s,
+                request_label=request_label,
+                deadline_at=_deadline_timestamp(deadline_at),
             )
         except httpx.HTTPStatusError as exc:
+            body = ""
+            try:
+                body = _log_value(exc.response.text)
+            except Exception:  # pragma: no cover - defensive logging only
+                body = "<unavailable>"
             print(
-                f"[{self.log_prefix}] model request failed: "
-                f"HTTP {exc.response.status_code}"
+                f"[{self.log_prefix}] model request failed problem_id={_log_value(request_label)}"
+                f" provider={_log_value(self.model_name)} error=HTTPStatusError"
+                f" detail=HTTP {exc.response.status_code}: {_log_value(exc)}"
+                f" body={body} elapsed_s={time.monotonic() - started_at:.3f}"
+                f" deadline_at={_deadline_timestamp(deadline_at)}"
             )
             return SolutionPayload(
                 problem_id=request.problem_id,
@@ -556,7 +713,12 @@ class DemoMiner:
                 raw_response="<model request failed>",
             )
         except Exception as exc:  # noqa: BLE001 - provider failure scores zero
-            print(f"[{self.log_prefix}] model request failed: {type(exc).__name__}")
+            print(
+                f"[{self.log_prefix}] model request failed problem_id={_log_value(request_label)}"
+                f" provider={_log_value(self.model_name)} error={type(exc).__name__}"
+                f" detail={_log_value(exc)} elapsed_s={time.monotonic() - started_at:.3f}"
+                f" deadline_at={_deadline_timestamp(deadline_at)}"
+            )
             return SolutionPayload(
                 problem_id=request.problem_id,
                 code="",
@@ -564,6 +726,12 @@ class DemoMiner:
             )
         draft_code = _extract_code(request, raw)
         if not self_verify or not draft_code:
+            print(
+                f"[{self.log_prefix}] solve completed problem_id={_log_value(request_label)}"
+                f" phase=draft elapsed_s={time.monotonic() - started_at:.3f}"
+                f" remaining_s={max(0.0, deadline - time.monotonic()):.3f}"
+                f" deadline_at={_deadline_timestamp(deadline_at)}"
+            )
             return SolutionPayload(
                 problem_id=request.problem_id,
                 code=draft_code,
@@ -578,28 +746,46 @@ class DemoMiner:
         if review_timeout_s > 0.0:
             try:
                 reviewed_raw = await asyncio.wait_for(
-                    self.client.complete(
+                    self._complete_with_context(
                         build_verification_messages(request, draft_code),
                         timeout_s=review_timeout_s,
+                        request_label=request_label + ":review",
+                        deadline_at=_deadline_timestamp(deadline_at),
                     ),
                     timeout=review_timeout_s,
                 )
                 reviewed_code = _extract_code(request, reviewed_raw)
                 if _is_well_formed_replacement(request, reviewed_code):
+                    print(
+                        f"[{self.log_prefix}] solve completed problem_id={_log_value(request_label)}"
+                        f" phase=reviewed elapsed_s={time.monotonic() - started_at:.3f}"
+                        f" remaining_s={max(0.0, deadline - time.monotonic()):.3f}"
+                        f" deadline_at={_deadline_timestamp(deadline_at)}"
+                    )
                     return SolutionPayload(
                         problem_id=request.problem_id,
                         code=reviewed_code,
                         raw_response=reviewed_raw,
                     )
                 print(
-                    f"[{self.log_prefix}] self-verification returned invalid "
-                    "source; using initial draft"
+                    f"[{self.log_prefix}] self-verification returned invalid source; "
+                    f"using initial draft problem_id={_log_value(request_label)}"
+                    f" elapsed_s={time.monotonic() - started_at:.3f}"
+                    f" deadline_at={_deadline_timestamp(deadline_at)}"
                 )
             except Exception as exc:  # noqa: BLE001 - retain the usable draft
                 print(
-                    f"[{self.log_prefix}] self-verification failed; using "
-                    f"initial draft ({type(exc).__name__})"
+                    f"[{self.log_prefix}] self-verification failed; using initial draft "
+                    f"problem_id={_log_value(request_label)} error={type(exc).__name__}:"
+                    f" {_log_value(exc)} elapsed_s={time.monotonic() - started_at:.3f}"
+                    f" deadline_at={_deadline_timestamp(deadline_at)}"
                 )
+        print(
+            f"[{self.log_prefix}] solve completed problem_id={_log_value(request_label)}"
+            f" elapsed_s={time.monotonic() - started_at:.3f}"
+            f" remaining_s={max(0.0, deadline - time.monotonic()):.3f}"
+            f" deadline_at={_deadline_timestamp(deadline_at)}"
+        )
         return SolutionPayload(
             problem_id=request.problem_id,
             code=draft_code,
@@ -635,14 +821,33 @@ class DemoMiner:
             getattr(self.client, "request_timeout_s", request.deadline_s)
         )
         timeout_s = min(request.deadline_s, provider_timeout_s)
+        request_deadline_mono = time.monotonic() + timeout_s
+        request_deadline_at = time.time() + timeout_s
+        print(
+            f"[{self.log_prefix}] request accepted problem_id={_log_value(request.problem_id)}"
+            f" signed_by={_log_value(headers.get('Epistula-Signed-By', ''))}"
+            f" request_nonce={_log_value(headers.get('Epistula-Uuid', ''))}"
+            f" request_deadline_s={request.deadline_s:.3f} provider_timeout_s={provider_timeout_s:.3f}"
+            f" effective_timeout_s={timeout_s:.3f}"
+            f" deadline_at={_deadline_timestamp(request_deadline_at)}"
+        )
 
         async def solve_with_slot() -> SolutionPayload:
             async with self.solve_slots:
-                return await self.solve(request, timeout_s)
+                return await self.solve(
+                    request,
+                    timeout_s,
+                    deadline_mono=request_deadline_mono,
+                    deadline_at=request_deadline_at,
+                )
 
         try:
             payload = await asyncio.wait_for(solve_with_slot(), timeout=timeout_s)
         except asyncio.TimeoutError:
+            print(
+                f"[{self.log_prefix}] request deadline exceeded problem_id={_log_value(request.problem_id)}"
+                f" effective_timeout_s={timeout_s:.3f} deadline_at={_deadline_timestamp(request_deadline_at)}"
+            )
             return 504, {"error": "solve deadline exceeded"}
         return 200, payload
 

@@ -13,6 +13,7 @@ import json
 import re
 import time
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from typing import Any, Literal, Optional
 from urllib.parse import urlsplit
 
@@ -21,6 +22,33 @@ from pydantic import Field, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 from .demo_miner import DemoMiner, build_demo_miner_app
+
+
+_MAX_RESPONSE_LOG_CHARS = 512
+
+
+def _log_value(value: object, *, limit: int = _MAX_RESPONSE_LOG_CHARS) -> str:
+    """Keep provider diagnostics on one line and cap untrusted response text."""
+
+    text = str(value).replace("\r", "\\r").replace("\n", "\\n").strip()
+    if not text:
+        return "<empty>"
+    if len(text) > limit:
+        return text[:limit] + "..."
+    return text
+
+
+def _deadline_timestamp(epoch_s: float) -> str:
+    return datetime.fromtimestamp(epoch_s, tz=timezone.utc).isoformat(
+        timespec="milliseconds"
+    ).replace("+00:00", "Z")
+
+
+def _response_excerpt(response: httpx.Response) -> str:
+    try:
+        return _log_value(response.text)
+    except Exception as exc:  # pragma: no cover - defensive logging only
+        return f"<unable to read response body: {type(exc).__name__}>"
 
 
 _FENCED_CODE_RE = re.compile(
@@ -297,27 +325,48 @@ class OpenAICompatibleClient:
         *,
         target: _ProviderTarget,
         deadline: float,
+        request_label: str = "",
+        deadline_at: str = "",
     ) -> str:
-        request = self._request_body(messages, model=target.model)
-        headers = self._headers(
-            target.api_key,
-            api_key_setting=target.api_key_setting,
+        started_at = time.monotonic()
+        context = f" request={request_label}" if request_label else ""
+        deadline_context = f" deadline_at={deadline_at}" if deadline_at else ""
+        setting_name = (
+            "OPENAI_BASE_URL"
+            if target.label == "primary"
+            else "OPENAI_FALLBACK_BASE_URL"
         )
-        completion_url = self._completion_url(
-            target.base_url,
-            setting_name=(
-                "OPENAI_BASE_URL"
-                if target.label == "primary"
-                else "OPENAI_FALLBACK_BASE_URL"
-            ),
-        )
+        try:
+            request = self._request_body(messages, model=target.model)
+            headers = self._headers(
+                target.api_key,
+                api_key_setting=target.api_key_setting,
+            )
+            completion_url = self._completion_url(
+                target.base_url,
+                setting_name=setting_name,
+            )
+        except Exception as exc:  # noqa: BLE001 - include setup failures in logs
+            print(
+                f"[{self.log_prefix}] provider setup failed provider={target.label}"
+                f" model={_log_value(target.model)} error={type(exc).__name__}: "
+                f"{_log_value(exc)}{deadline_context}{context}"
+            )
+            raise
 
         for attempt in range(self.settings.openai_max_retries + 1):
             remaining = deadline - time.monotonic()
             if remaining <= 0:
+                print(
+                    f"[{self.log_prefix}] provider deadline exceeded provider={target.label}"
+                    f" model={_log_value(target.model)} attempt={attempt + 1}"
+                    f" elapsed_s={time.monotonic() - started_at:.3f}{deadline_context}{context}"
+                )
                 raise TimeoutError(
                     f"OpenAI-compatible {target.label} request deadline exceeded"
                 )
+            attempt_started = time.monotonic()
+            response_body = ""
             try:
                 response = await self._http.post(
                     completion_url,
@@ -325,7 +374,18 @@ class OpenAICompatibleClient:
                     json=request,
                     timeout=remaining,
                 )
+                response_body = _response_excerpt(response)
                 if self._is_retryable_status(response.status_code):
+                    retrying = attempt < self.settings.openai_max_retries
+                    print(
+                        f"[{self.log_prefix}] provider HTTP failure provider={target.label}"
+                        f" model={_log_value(target.model)} status={response.status_code}"
+                        f" (HTTP {response.status_code})"
+                        f" attempt={attempt + 1}/{self.settings.openai_max_retries + 1}"
+                        f" retrying={str(retrying).lower()}"
+                        f" elapsed_s={time.monotonic() - attempt_started:.3f}"
+                        f" body={response_body}{deadline_context}{context}"
+                    )
                     if attempt < self.settings.openai_max_retries:
                         await asyncio.sleep(
                             min(
@@ -334,18 +394,57 @@ class OpenAICompatibleClient:
                             )
                         )
                         continue
+                elif response.status_code >= 400:
+                    print(
+                        f"[{self.log_prefix}] provider HTTP failure provider={target.label}"
+                        f" model={_log_value(target.model)} status={response.status_code}"
+                        f" (HTTP {response.status_code})"
+                        f" attempt={attempt + 1}/{self.settings.openai_max_retries + 1}"
+                        f" retrying=false elapsed_s={time.monotonic() - attempt_started:.3f}"
+                        f" body={response_body}{deadline_context}{context}"
+                    )
                 response.raise_for_status()
                 data = response.json()
                 content = data["choices"][0]["message"]["content"]
                 if not isinstance(content, str) or not content.strip():
+                    print(
+                        f"[{self.log_prefix}] provider invalid response provider={target.label}"
+                        f" model={_log_value(target.model)} reason=empty_completion"
+                        f" attempt={attempt + 1} elapsed_s={time.monotonic() - attempt_started:.3f}"
+                        f" response_keys={_log_value(list(data) if isinstance(data, dict) else type(data).__name__)}"
+                        f" body={response_body}"
+                        f"{deadline_context}{context}"
+                    )
                     raise ValueError("provider returned an empty completion")
                 sanitized = _suppress_reasoning_text(content)
                 if not sanitized:
+                    print(
+                        f"[{self.log_prefix}] provider invalid response provider={target.label}"
+                        f" model={_log_value(target.model)} reason=reasoning_without_solution"
+                        f" attempt={attempt + 1} elapsed_s={time.monotonic() - attempt_started:.3f}"
+                        f"{deadline_context}{context}"
+                    )
                     raise ValueError(
                         "provider returned reasoning without a solution"
                     )
+                print(
+                    f"[{self.log_prefix}] provider success provider={target.label}"
+                    f" model={_log_value(target.model)} attempt={attempt + 1}"
+                    f" elapsed_s={time.monotonic() - attempt_started:.3f}"
+                    f" remaining_s={max(0.0, deadline - time.monotonic()):.3f}"
+                    f"{deadline_context}{context}"
+                )
                 return sanitized
-            except (httpx.TimeoutException, httpx.TransportError):
+            except (httpx.TimeoutException, httpx.TransportError) as exc:
+                retrying = attempt < self.settings.openai_max_retries
+                print(
+                    f"[{self.log_prefix}] provider transport failure provider={target.label}"
+                    f" model={_log_value(target.model)} error={type(exc).__name__}:"
+                    f" {_log_value(exc)} attempt={attempt + 1}/{self.settings.openai_max_retries + 1}"
+                    f" retrying={str(retrying).lower()} elapsed_s={time.monotonic() - attempt_started:.3f}"
+                    f" remaining_s={max(0.0, deadline - time.monotonic()):.3f}"
+                    f"{deadline_context}{context}"
+                )
                 if attempt >= self.settings.openai_max_retries:
                     raise
                 await asyncio.sleep(
@@ -355,6 +454,13 @@ class OpenAICompatibleClient:
                     )
                 )
             except (KeyError, IndexError, TypeError, ValueError) as exc:
+                print(
+                    f"[{self.log_prefix}] provider response parse failure provider={target.label}"
+                    f" model={_log_value(target.model)} error={type(exc).__name__}:"
+                    f" {_log_value(exc)} attempt={attempt + 1}"
+                    f" elapsed_s={time.monotonic() - attempt_started:.3f}"
+                    f" body={response_body}{deadline_context}{context}"
+                )
                 raise RuntimeError(
                     f"OpenAI-compatible {target.label} provider returned an "
                     "invalid response"
@@ -369,11 +475,15 @@ class OpenAICompatibleClient:
         messages: list[dict[str, str]],
         *,
         timeout_s: float,
+        request_label: str = "",
+        deadline_at: str = "",
     ) -> str:
         budget_s = min(timeout_s, self.request_timeout_s)
+        started_at = time.monotonic()
         if budget_s <= 0:
             raise TimeoutError("OpenAI-compatible request deadline exceeded")
         overall_deadline = time.monotonic() + budget_s
+        deadline_at = deadline_at or _deadline_timestamp(time.time() + budget_s)
         fallback = self._fallback_target()
         primary = self._primary_target()
         if fallback is None:
@@ -381,6 +491,8 @@ class OpenAICompatibleClient:
                 messages,
                 target=primary,
                 deadline=overall_deadline,
+                request_label=request_label,
+                deadline_at=deadline_at,
             )
 
         # Hedge the two providers under the same absolute deadline. The first
@@ -393,6 +505,8 @@ class OpenAICompatibleClient:
                 messages,
                 target=primary,
                 deadline=overall_deadline,
+                request_label=request_label,
+                deadline_at=deadline_at,
             )
         )
         fallback_task = asyncio.create_task(
@@ -400,6 +514,8 @@ class OpenAICompatibleClient:
                 messages,
                 target=fallback,
                 deadline=overall_deadline,
+                request_label=request_label,
+                deadline_at=deadline_at,
             )
         )
         pending: set[asyncio.Task[str]] = {primary_task, fallback_task}
@@ -428,13 +544,20 @@ class OpenAICompatibleClient:
                     return primary_result  # type: ignore[return-value]
                 if fallback_result is not missing:
                     print(
-                        "[openai-miner] fallback provider supplied hedged "
-                        "response"
+                        f"[{self.log_prefix}] fallback provider supplied hedged response"
+                        f" request={request_label or '<unknown>'}"
+                        f" elapsed_s={time.monotonic() - started_at:.3f}"
+                        f" remaining_s={max(0.0, overall_deadline - time.monotonic()):.3f}"
+                        f" deadline_at={deadline_at}"
                     )
                     return fallback_result  # type: ignore[return-value]
 
+            detail = "; ".join(
+                f"{type(exc).__name__}: {_log_value(exc)}" for exc in errors
+            )
             error = RuntimeError(
                 "primary and fallback OpenAI-compatible providers failed"
+                + (f" ({detail})" if detail else "")
             )
             raise error from (errors[-1] if errors else None)
         finally:
