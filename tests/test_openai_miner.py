@@ -47,7 +47,6 @@ def miner_settings(**updates) -> OpenAICompatibleSettings:
     values = {
         "openai_api_key": "test-key",
         "openai_model": "provider/code-model",
-        "miner_self_test": False,
     }
     values.update(updates)
     return OpenAICompatibleSettings(
@@ -114,27 +113,6 @@ async def test_chat_completion_contract_and_auth_header():
             "Planning artifact:\n```json\n{\"approach\": \"discard\"}\n```\n"
             "```rust\nfn main() {}\n```\n<reasoning>also private</reasoning>",
             "```rust\nfn main() {}\n```",
-        ),
-        (
-            "<think>private</think>\n"
-            "```self-tests\n"
-            '{"tests":[{"args":[1,2],"kwargs":{},"expected":3}]}\n'
-            "```\n"
-            "```python\ndef add(a, b):\n    return a + b\n```",
-            "```self-tests\n"
-            '{"tests":[{"args":[1,2],"kwargs":{},"expected":3}]}\n'
-            "```\n\n"
-            "```python\ndef add(a, b):\n    return a + b\n```",
-        ),
-        (
-            "```json\n"
-            '{"tests":[{"args":[1,2],"kwargs":{},"expected":3}]}\n'
-            "```\n"
-            "```python\ndef add(a, b):\n    return a + b\n```",
-            "```json\n"
-            '{"tests":[{"args":[1,2],"kwargs":{},"expected":3}]}\n'
-            "```\n\n"
-            "```python\ndef add(a, b):\n    return a + b\n```",
         ),
     ],
 )

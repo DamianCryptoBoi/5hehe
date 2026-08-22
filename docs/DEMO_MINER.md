@@ -9,10 +9,9 @@ validator/miner wire protocol. It:
 4. extracts the Python solution and signs the exact response bytes with the
    miner hotkey.
 
-It does not receive hidden evaluation cases. It runs model-generated, public,
-and operator-owned preflight cases locally, while validators still reveal their
-private tests only after committing miner responses and execute the submitted
-code in separate validator sandboxes. Public task statements and examples are
+It does not receive hidden evaluation cases. Validators reveal their private
+tests only after committing miner responses and execute the submitted code in
+separate validator sandboxes. Public task statements and examples are
 sent to the configured model provider, so operators should review that
 provider's data-handling terms.
 
@@ -87,11 +86,6 @@ MINER_MIN_STAKE=0
 MINER_MAX_CONCURRENT_REQUESTS=4
 MINER_MAX_REQUEST_BYTES=1000000
 MINER_TASK_ARCHIVE_FILE=data/miner_tasks.jsonl
-MINER_SELF_TEST=true
-MINER_SELF_TEST_FILE=data/miner_tests.jsonl
-MINER_SELF_TEST_MAX_GENERATED_CASES=8
-MINER_SELF_TEST_EXECUTOR=docker
-MINER_SELF_TEST_TIMEOUT_S=5
 MINER_METAGRAPH_SYNC_S=300
 ```
 
@@ -110,39 +104,15 @@ GLM_REQUEST_TIMEOUT_S=280
 GLM_MAX_RETRIES=2
 MINER_SELF_VERIFY=true
 MINER_SELF_VERIFY_RESERVE_S=90
-MINER_SELF_VERIFY_MAX_ATTEMPTS=3
 ```
 
 Lower output or reasoning budgets reduce cost and latency, but may reduce the
 pass rate on harder tasks.
 
-With self-tests enabled, the initial response contains source plus a generated
-fixed test suite. The miner executes that suite with public and operator-owned
-cases. A pass is returned immediately; a failure is sent back with test evidence
-for repair and retested, up to `MINER_SELF_VERIFY_MAX_ATTEMPTS` times while the
-request deadline permits. The tests stay fixed across repairs. Without an
-executed failing suite, self-verification retains its single independent review
-behavior. If the combined response omits the suite, a bounded test-only provider
-call recovers it. Both `self-tests` and schema-valid `json` fences are accepted.
-If no repair passes before the limit, the strongest well-formed candidate is
-submitted instead of an empty guaranteed-zero answer.
-
-## Local self-tests
-
-`MINER_SELF_TEST=true` runs the model-generated suite, public examples, and any
-operator-owned cases matching the task fingerprint in `MINER_SELF_TEST_FILE`.
-The operator file is JSONL:
-
-```json
-{"task_fingerprint":"<sha256>","tests":[{"args":[2,3],"kwargs":{},"expected":5}]}
-```
-
-Generated cases are preflight heuristics, not validator hidden tests. The
-default executor is Docker with no network and bounded resources. The
-`subprocess` executor is available for local development only; it is not a full
-Linux security boundary. A failed local test triggers repair; exhausted repairs
-fall back to the candidate with the fewest failures. An unavailable self-test
-sandbox is logged and treated as inconclusive.
+With `MINER_SELF_VERIFY=true`, the miner makes one independent review request
+after the draft. A valid reviewed source replaces the draft; malformed or timed-
+out review output preserves the original draft. Set `MINER_SELF_VERIFY=false` to
+use one provider request.
 
 ## Task archive
 
@@ -160,15 +130,15 @@ valid model request. Repeated requests can be deduplicated by
 ## Real-provider sample smoke test
 
 From the repository root, run all five sample challenges through the real GLM
-provider, signed miner endpoint, self-review, and Docker self-test flow:
+provider, signed miner endpoint, and one-review flow:
 
 ```bash
 PYTHONPATH=. .venv/bin/python scripts/smoke_miner_samples.py --provider glm
 ```
 
-The command sends only the first sample case in each model request and keeps the
-remaining sample cases as local operator tests. Each sample logs provider-call
-times, local-test times, signed-response latency, and per-case results. Use
+The command sends only the first sample case in each model request and runs all
+sample cases after the signed response for reporting. Each sample logs provider-
+call times, signed-response latency, and per-case results. Use
 `--example NAME` to run a subset. The command exits nonzero if any returned
 solution fails its sample cases. Structured results are appended to
 `data/miner_sample_smoke.jsonl`; generated draft, review, and submitted source
@@ -183,6 +153,4 @@ PYTHONPATH=. .venv/bin/python scripts/smoke_miner_samples.py \
 ```
 
 The authored cases run only after the signed response as an external accuracy
-report. The generated suite is saved as `generated_tests.json` beside the draft
-and submitted source artifacts. `request.json` confirms that
-`public_examples` was empty, and `repair_N.*` files retain each loop candidate.
+report. `request.json` confirms that `public_examples` was empty.

@@ -1,12 +1,12 @@
 #!/usr/bin/env python3
 """Send sample Python and Rust tasks through the signed real miner flow.
 
-The first sample case is included as public context. Remaining cases are loaded
-as operator-owned local tests, so this exercises provider inference, optional
-self-review, fingerprint selection, the signed endpoint, and the configured
-language executor. Pass ``--problem-only`` to hide every authored sample case
-from the miner and use them only for post-response reporting. The default
-selection covers all five samples.
+The first sample case is included as public context. All cases are executed only
+after the signed response, so this exercises provider inference, optional
+self-review, the signed endpoint, and the configured language executor without
+feeding evaluation results back into the solver. Pass ``--problem-only`` to
+hide every authored sample case from the miner. The default selection covers
+all five samples.
 """
 
 from __future__ import annotations
@@ -31,10 +31,8 @@ from rlvr.neurons.demo_miner import (
     DemoMinerSettings,
     GLM52Client,
     build_demo_miner_app,
-    extract_generated_tests,
     extract_python,
     extract_rust,
-    semantic_task_fingerprint,
 )
 from rlvr.neurons.openai_miner import (
     OpenAICompatibleClient,
@@ -84,19 +82,13 @@ def load_sample(
 def build_provider(
     provider: str,
     env_file: str,
-    tests_file: str,
     archive_file: str,
     *,
     review: bool,
-    self_test_timeout_s: float,
 ):
     common = {
         "_env_file": env_file,
-        "miner_self_test": True,
-        "miner_self_test_file": tests_file,
         "miner_task_archive_file": archive_file,
-        "miner_self_test_executor": "docker",
-        "miner_self_test_timeout_s": self_test_timeout_s,
         "miner_self_verify": review,
     }
     if provider == "openai":
@@ -122,7 +114,6 @@ class _Timeline:
     def __init__(self):
         self.events: list[tuple[str, float, float]] = []
         self.ai_outputs: list[tuple[str, str]] = []
-        self.test_results: list[list[Any]] = []
 
     def add(self, label: str, started: float, finished: float) -> None:
         self.events.append((label, started, finished))
@@ -130,7 +121,6 @@ class _Timeline:
     def clear(self) -> None:
         self.events.clear()
         self.ai_outputs.clear()
-        self.test_results.clear()
 
 
 class _TimedProvider:
@@ -151,10 +141,7 @@ class _TimedProvider:
         return self.inner.log_prefix
 
     async def complete(self, messages, *, timeout_s):
-        system_content = messages[0].get("content", "") if messages else ""
-        if "independent test designer" in system_content:
-            stage = "self-tests-ai"
-        elif any(message.get("role") == "assistant" for message in messages):
+        if any(message.get("role") == "assistant" for message in messages):
             stage = "review-ai"
         else:
             stage = "draft-ai"
@@ -168,21 +155,6 @@ class _TimedProvider:
 
     async def aclose(self):
         await self.inner.aclose()
-
-
-class _TimedTester:
-    def __init__(self, inner: Any, timeline: _Timeline):
-        self.inner = inner
-        self.timeline = timeline
-
-    def run(self, request, code, generated_tests=None):
-        started = time.perf_counter()
-        try:
-            results = self.inner.run(request, code, generated_tests)
-            self.timeline.test_results.append(results)
-            return results
-        finally:
-            self.timeline.add("tests", started, time.perf_counter())
 
 
 def _extract_sample_code(language: str, raw: str) -> str:
@@ -211,10 +183,7 @@ def preflight(selected: list[str], *, skip_docker: bool) -> None:
             raise RuntimeError("Docker CLI not found on PATH")
         try:
             result = subprocess.run(
-                [docker, "info"],
-                capture_output=True,
-                text=True,
-                timeout=20,
+                [docker, "info"], capture_output=True, text=True, timeout=20
             )
         except OSError as error:
             raise RuntimeError(f"could not run docker info: {error}") from error
@@ -281,9 +250,6 @@ async def run_sample(
     )
     timeline.add("signed-submit", wire_started, time.perf_counter())
     solution: SolutionResponse = artifact.to_solution(problem.problem_id)
-    if miner.self_tester is None:  # pragma: no cover - fixed by build_provider
-        raise RuntimeError("sample smoke test requires miner self-tests")
-
     request = _request_for_sample(
         name,
         payload,
@@ -292,44 +258,33 @@ async def run_sample(
         deadline_s,
         problem_only=problem_only,
     )
-    # Authored cases are applied only after the signed response. Giving them to
-    # a fresh request as public examples avoids selecting the miner's local
-    # fingerprint corpus and keeps this reporting pass outside the solve loop.
-    report_request = request.model_copy(update={"public_examples": cases})
-    results = await asyncio.to_thread(
-        miner.self_tester.run,
-        report_request,
-        solution.code,
+    from rlvr.execution.executor import get_executor
+    from types import SimpleNamespace
+
+    executor = get_executor(
+        SimpleNamespace(executor="docker"), language=payload["language"]
     )
+    report_started = time.perf_counter()
+    results = await asyncio.to_thread(
+        executor.run_tests,
+        solution.code,
+        request.entrypoint,
+        cases,
+        5.0,
+    )
+    report_finished = time.perf_counter()
     sample_finished = time.perf_counter()
     passed = sum(result.passed for result in results)
     submit_status = "PASS" if not artifact.error else "FAIL"
     ordered_events = sorted(timeline.events, key=lambda event: event[1])
-    wire_finished = next(
-        finished
-        for label, _started, finished in ordered_events
-        if label == "signed-submit"
-    )
-    test_count = 0
-    report_events: list[tuple[str, float, float]] = []
     stage_records: list[dict[str, Any]] = []
     for label, started, finished in ordered_events:
-        if label == "tests" and started >= wire_finished:
-            report_events.append((label, started, finished))
-            continue
-        if label in {"draft-ai", "self-tests-ai", "review-ai"}:
+        if label in {"draft-ai", "review-ai"}:
             display_label = label
-        elif label == "tests":
-            test_count += 1
-            display_label = "draft-tests" if test_count == 1 else "review-tests"
         else:
             continue
         duration_ms = (finished - started) * 1000.0
         stage = {"stage": display_label, "duration_ms": round(duration_ms, 3)}
-        if label == "tests" and test_count <= len(timeline.test_results):
-            stage_results = timeline.test_results[test_count - 1]
-            stage["passed"] = sum(result.passed for result in stage_results)
-            stage["total"] = len(stage_results)
         stage_records.append(stage)
         print(f"  {display_label}: {duration_ms:.0f} ms")
     submit_detail = artifact.error or "validator accepted signed response"
@@ -345,17 +300,16 @@ async def run_sample(
         f"  signed-submit: {submit_status} ({submit_duration_ms:.0f} ms; "
         f"{submit_detail})"
     )
-    for _label, started, finished in report_events:
-        duration_ms = (finished - started) * 1000.0
-        stage_records.append(
-            {
-                "stage": "tests-report",
-                "duration_ms": round(duration_ms, 3),
-                "passed": passed,
-                "total": len(results),
-            }
-        )
-        print(f"  tests-report: {duration_ms:.0f} ms")
+    report_duration_ms = (report_finished - report_started) * 1000.0
+    stage_records.append(
+        {
+            "stage": "tests-report",
+            "duration_ms": round(report_duration_ms, 3),
+            "passed": passed,
+            "total": len(results),
+        }
+    )
+    print(f"  tests-report: {report_duration_ms:.0f} ms")
     print(
         f"[{name}] language={payload['language']} model={miner.model_name} "
         f"response_bytes={len(solution.code.encode('utf-8'))} "
@@ -380,22 +334,11 @@ async def run_sample(
         "",
     )
     draft_code = _extract_sample_code(payload["language"], draft_output)
-    repair_codes = [
+    review_codes = [
         _extract_sample_code(payload["language"], model_output)
         for stage, model_output in timeline.ai_outputs
         if stage == "review-ai"
     ]
-    generated_tests: list[TestCase] = []
-    for _stage, model_output in timeline.ai_outputs:
-        generated_tests = extract_generated_tests(
-            request,
-            model_output,
-            max_cases=int(
-                getattr(miner.settings, "miner_self_test_max_generated_cases", 8)
-            ),
-        )
-        if generated_tests:
-            break
     code_files = {
         "request": _write_code(
             sample_artifacts / "request.json",
@@ -404,29 +347,10 @@ async def run_sample(
         "draft": _write_code(sample_artifacts / f"draft{suffix}", draft_code),
         "review": _write_code(
             sample_artifacts / f"review{suffix}",
-            repair_codes[0] if repair_codes else "",
+            review_codes[0] if review_codes else "",
         ),
-        "repairs": [
-            _write_code(
-                sample_artifacts / f"repair_{index}{suffix}",
-                repair_code,
-            )
-            for index, repair_code in enumerate(repair_codes, 1)
-        ],
         "submitted": _write_code(
             sample_artifacts / f"submitted{suffix}", solution.code
-        ),
-        "generated_tests": _write_code(
-            sample_artifacts / "generated_tests.json",
-            json.dumps(
-                {
-                    "tests": [
-                        case.model_dump(mode="json") for case in generated_tests
-                    ]
-                },
-                ensure_ascii=False,
-                indent=2,
-            ),
         ),
     }
     accepted = (
@@ -487,48 +411,23 @@ async def async_main(args: argparse.Namespace) -> int:
     print(
         f"run_id={run_id} provider={args.provider} samples={len(selected)} "
         f"review={'on' if not args.no_review else 'off'} "
-        f"input={'problem-only' if args.problem_only else 'public-plus-local'}"
+        f"input={'problem-only' if args.problem_only else 'one-public-example'}"
     )
     print(f"log_file={log_file}")
     print(f"artifacts_dir={artifacts_root / run_id}")
 
     with TemporaryDirectory(prefix="hone-miner-samples-") as directory:
-        tests_file = str(Path(directory) / "miner_tests.jsonl")
-        records: list[str] = []
         loaded: list[tuple[str, dict[str, Any], str, list[TestCase], list[str]]] = []
         for name in selected:
             payload, statement, cases, labels = load_sample(name)
-            request = _request_for_sample(
-                name,
-                payload,
-                statement,
-                cases,
-                args.deadline,
-                problem_only=args.problem_only,
-            )
-            if not args.problem_only:
-                records.append(
-                    json.dumps(
-                        {
-                            "task_fingerprint": semantic_task_fingerprint(request),
-                            "tests": [
-                                case.model_dump(mode="json") for case in cases[1:]
-                            ],
-                        },
-                        separators=(",", ":"),
-                    )
-                )
             loaded.append((name, payload, statement, cases, labels))
-        Path(tests_file).write_text("\n".join(records) + "\n", encoding="utf-8")
 
         archive_file = str(Path(directory) / "miner_tasks.jsonl")
         settings, client = build_provider(
             args.provider,
             args.env_file,
-            tests_file,
             archive_file,
             review=not args.no_review,
-            self_test_timeout_s=args.self_test_timeout,
         )
         try:
             from bittensor_wallet import Keypair
@@ -547,9 +446,6 @@ async def async_main(args: argparse.Namespace) -> int:
             wallet=_WalletLike(miner_key),
             metagraph=_FakeMetagraph(validator_key.ss58_address),
         )
-        if miner.self_tester is None:  # pragma: no cover - fixed by settings
-            raise RuntimeError("signed smoke test requires miner self-tests")
-        miner.self_tester = _TimedTester(miner.self_tester, timeline)
         app = build_demo_miner_app(miner)
         http = httpx.AsyncClient(
             transport=httpx.ASGITransport(app=app),
@@ -678,12 +574,11 @@ def main() -> int:
         "--problem-only",
         action="store_true",
         help=(
-            "send no authored cases to the miner; generated self-tests are the "
-            "only solve-time tests, and sample cases run afterward for reporting"
+            "send no authored cases to the miner; sample cases run afterward "
+            "for reporting only"
         ),
     )
     parser.add_argument("--deadline", type=float, default=300.0)
-    parser.add_argument("--self-test-timeout", type=float, default=5.0)
     parser.add_argument(
         "--log-file",
         default="data/miner_sample_smoke.jsonl",
