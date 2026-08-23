@@ -21,7 +21,15 @@ import httpx
 from pydantic import Field, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
-from .demo_miner import DemoMiner, build_demo_miner_app
+from .demo_miner import (
+    DemoMiner,
+    build_demo_miner_app,
+    build_model_messages,
+    _extract_code,
+)
+from ..execution.executor import Executor, get_executor
+from ..protocol import TaskRequest, SolutionPayload
+from ..types import ExecutionResult, TestCase
 
 
 _MAX_RESPONSE_LOG_CHARS = 512
@@ -85,6 +93,10 @@ class OpenAICompatibleSettings(BaseSettings):
     openai_max_retries: int = Field(default=2, ge=0, le=10)
     miner_self_verify: bool = True
     miner_self_verify_reserve_s: float = Field(default=90.0, ge=0.0, le=1800.0)
+    miner_execution_loop: bool = True
+    miner_execution_loop_max_retries: int = Field(default=2, ge=0, le=10)
+    miner_execution_loop_timeout_s: float = Field(default=5.0, gt=0.0, le=60.0)
+    miner_execution_loop_keep_best: bool = True
     openai_fallback_base_url: str = ""
     openai_fallback_model: str = ""
     openai_fallback_api_key: str = ""
@@ -566,6 +578,245 @@ class OpenAICompatibleClient:
 
 class OpenAICompatibleMiner(DemoMiner):
     """Hone protocol server using an OpenAI-compatible completion client."""
+
+    def __init__(self, settings, client, **kwargs):
+        super().__init__(settings, client, **kwargs)
+        self.executor = None
+        try:
+            from types import SimpleNamespace
+
+            executor_settings = SimpleNamespace(
+                executor="subprocess",
+                per_test_timeout_s=float(
+                    getattr(settings, "miner_execution_loop_timeout_s", 5.0)
+                ),
+                docker_image="python:3.12-slim",
+                docker_memory="256m",
+                docker_cpus=1.0,
+                docker_pids_limit=128,
+                use_sandbox_exec=True,
+            )
+            self.executor = get_executor(executor_settings, language="python")
+        except Exception:
+            self.executor = None
+
+    async def solve(
+        self,
+        request: TaskRequest,
+        timeout_s: float,
+        *,
+        deadline_mono: Optional[float] = None,
+        deadline_at: Optional[float] = None,
+    ) -> SolutionPayload:
+        use_loop = bool(
+            getattr(self.settings, "miner_execution_loop", False)
+            and request.language == "python"
+            and self.executor is not None
+            and request.public_examples
+        )
+        if not use_loop:
+            return await super().solve(
+                request,
+                timeout_s,
+                deadline_mono=deadline_mono,
+                deadline_at=deadline_at,
+            )
+        return await self._solve_with_execution_loop(
+            request,
+            timeout_s,
+            deadline_mono=deadline_mono,
+            deadline_at=deadline_at,
+        )
+
+    async def _solve_with_execution_loop(
+        self,
+        request: TaskRequest,
+        timeout_s: float,
+        *,
+        deadline_mono: Optional[float] = None,
+        deadline_at: Optional[float] = None,
+    ) -> SolutionPayload:
+        started_at = time.monotonic()
+        deadline = (
+            deadline_mono
+            if deadline_mono is not None
+            else started_at + timeout_s
+        )
+        deadline_at_ts = (
+            deadline_at
+            if deadline_at is not None
+            else time.time() + timeout_s
+        )
+        request_label = request.problem_id
+
+        available_s = max(0.0, deadline - time.monotonic())
+        max_retries = int(
+            getattr(self.settings, "miner_execution_loop_max_retries", 2)
+        )
+        test_timeout_s = float(
+            getattr(self.settings, "miner_execution_loop_timeout_s", 5.0)
+        )
+        keep_best = bool(
+            getattr(self.settings, "miner_execution_loop_keep_best", True)
+        )
+
+        messages = build_model_messages(request)
+        best_code = ""
+        code = ""
+        raw = ""
+        last_test_results: list[ExecutionResult] = []
+
+        print(
+            f"[{self.log_prefix}] execution loop started"
+            f" problem_id={_log_value(request_label)}"
+            f" max_retries={max_retries}"
+            f" public_examples={len(request.public_examples)}"
+            f" deadline_at={_deadline_timestamp(deadline_at_ts)}"
+        )
+
+        for attempt in range(max_retries + 1):
+            remaining = max(0.0, deadline - time.monotonic())
+            if remaining <= 1.0:
+                print(
+                    f"[{self.log_prefix}] execution loop deadline exceeded"
+                    f" problem_id={_log_value(request_label)}"
+                    f" attempt={attempt + 1}"
+                    f" elapsed_s={time.monotonic() - started_at:.3f}"
+                )
+                break
+
+            gen_timeout_s = remaining
+            try:
+                raw = await self._complete_with_context(
+                    list(messages),
+                    timeout_s=gen_timeout_s,
+                    request_label=request_label,
+                    deadline_at=_deadline_timestamp(deadline_at_ts),
+                )
+            except Exception as exc:
+                print(
+                    f"[{self.log_prefix}] execution loop generate failed"
+                    f" problem_id={_log_value(request_label)}"
+                    f" attempt={attempt + 1}"
+                    f" error={type(exc).__name__}: {_log_value(exc)}"
+                    f" elapsed_s={time.monotonic() - started_at:.3f}"
+                )
+                break
+
+            code = _extract_code(request, raw)
+            if not code:
+                print(
+                    f"[{self.log_prefix}] execution loop no code extracted"
+                    f" problem_id={_log_value(request_label)}"
+                    f" attempt={attempt + 1}"
+                )
+                break
+
+            try:
+                results = await asyncio.wait_for(
+                    asyncio.to_thread(
+                        self.executor.run_tests,
+                        code,
+                        request.entrypoint,
+                        request.public_examples,
+                        test_timeout_s,
+                    ),
+                    timeout=min(remaining, 30.0),
+                )
+            except asyncio.TimeoutError:
+                print(
+                    f"[{self.log_prefix}] execution loop test timeout"
+                    f" problem_id={_log_value(request_label)}"
+                    f" attempt={attempt + 1}"
+                    f" elapsed_s={time.monotonic() - started_at:.3f}"
+                )
+                best_code = code
+                break
+
+            passed = sum(1 for r in results if r.passed)
+            total = len(results)
+
+            if passed == total and total > 0:
+                print(
+                    f"[{self.log_prefix}] execution loop solved"
+                    f" problem_id={_log_value(request_label)}"
+                    f" attempt={attempt + 1}"
+                    f" passed={passed}/{total}"
+                    f" elapsed_s={time.monotonic() - started_at:.3f}"
+                )
+                return SolutionPayload(
+                    problem_id=request.problem_id,
+                    code=code,
+                    raw_response=raw,
+                )
+
+            last_test_results = results
+            if keep_best:
+                best_code = code
+
+            remaining_after = max(0.0, deadline - time.monotonic())
+            if attempt >= max_retries or remaining_after <= 5.0:
+                print(
+                    f"[{self.log_prefix}] execution loop exhausted"
+                    f" problem_id={_log_value(request_label)}"
+                    f" attempt={attempt + 1}"
+                    f" passed={passed}/{total}"
+                    f" elapsed_s={time.monotonic() - started_at:.3f}"
+                )
+                break
+
+            feedback_lines = [
+                f"The code above failed {total - passed}/{total} public examples:",
+            ]
+            for i, r in enumerate(results):
+                if not r.passed:
+                    test_case = request.public_examples[i]
+                    label = str(
+                        getattr(test_case, "name", f"case {i}")
+                    )
+                    if r.error:
+                        detail = r.error[:200]
+                    elif r.actual_repr:
+                        detail = f"got {r.actual_repr[:200]}"
+                    else:
+                        detail = "wrong result"
+                    feedback_lines.append(f"- Test {label}: {detail}")
+
+            feedback_lines.append("")
+            feedback_lines.append(
+                "Fix the issues above. Output exactly one complete "
+                f"fenced `python` code block with the corrected "
+                f"`{request.entrypoint}` function and nothing else."
+            )
+
+            messages.append(
+                {"role": "assistant", "content": f"```python\n{code}\n```"}
+            )
+            messages.append(
+                {"role": "user", "content": "\n".join(feedback_lines)}
+            )
+
+            print(
+                f"[{self.log_prefix}] execution loop retrying"
+                f" problem_id={_log_value(request_label)}"
+                f" attempt={attempt + 1}"
+                f" failed={total - passed}/{total}"
+                f" elapsed_s={time.monotonic() - started_at:.3f}"
+                f" remaining_s={remaining_after:.3f}"
+            )
+
+        fallback_code = best_code or code
+        print(
+            f"[{self.log_prefix}] execution loop returning fallback"
+            f" problem_id={_log_value(request_label)}"
+            f" has_code={bool(fallback_code)}"
+            f" elapsed_s={time.monotonic() - started_at:.3f}"
+        )
+        return SolutionPayload(
+            problem_id=request.problem_id,
+            code=fallback_code,
+            raw_response=raw,
+        )
 
 
 def build_openai_miner_app(miner: OpenAICompatibleMiner):

@@ -567,6 +567,7 @@ class DemoMiner:
         self.task_archive = TaskArchive(
             getattr(settings, "miner_task_archive_file", "data/miner_tasks.jsonl")
         )
+        self.executor = None  # subclasses may set a local executor for testing
 
     @property
     def model_name(self) -> str:
