@@ -594,10 +594,18 @@ class OpenAICompatibleMiner(DemoMiner):
                 docker_memory="256m",
                 docker_cpus=1.0,
                 docker_pids_limit=128,
-                use_sandbox_exec=True,
+                use_sandbox_exec=False,
             )
             self.executor = get_executor(executor_settings, language="python")
-        except Exception:
+            print(
+                f"[{self.log_prefix}] execution loop executor ready: "
+                f"{type(self.executor).__name__}"
+            )
+        except Exception as exc:
+            print(
+                f"[{self.log_prefix}] execution loop executor init failed: "
+                f"{type(exc).__name__}: {exc}"
+            )
             self.executor = None
 
     async def solve(
